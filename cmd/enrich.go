@@ -23,13 +23,15 @@ import (
 )
 
 var (
-	enrichStatus   bool
-	enrichReview   bool
-	enrichIssueKey string
-	enrichLimit    int
-	enrichReset    bool
-	enrichAgent    string
-	enrichParallel int
+	enrichStatus        bool
+	enrichReview        bool
+	enrichIssueKey      string
+	enrichLimit         int
+	enrichReset         bool
+	enrichAgent         string
+	enrichParallel      int
+	enrichRejectUnknown bool
+	enrichFilter        string
 )
 
 var enrichCmd = &cobra.Command{
@@ -49,6 +51,8 @@ func init() {
 	enrichCmd.Flags().BoolVar(&enrichReset, "reset", false, "re-enrich already enriched issues")
 	enrichCmd.Flags().StringVar(&enrichAgent, "agent", "", "agent to use: claude or codex (overrides config)")
 	enrichCmd.Flags().IntVar(&enrichParallel, "parallel", 0, "concurrent workers (overrides config)")
+	enrichCmd.Flags().BoolVar(&enrichRejectUnknown, "reject-unknown", false, "reject all enrichments with unknown confidence")
+	enrichCmd.Flags().StringVar(&enrichFilter, "filter", "", "filter review by decision: pending, accepted, rejected, deferred")
 }
 
 func runEnrich(cmd *cobra.Command, args []string) error {
@@ -60,8 +64,10 @@ func runEnrich(cmd *cobra.Command, args []string) error {
 	switch {
 	case enrichStatus:
 		return showEnrichStatus(store)
+	case enrichRejectUnknown:
+		return rejectUnknownEnrichments(store)
 	case enrichReview:
-		return interactiveEnrichReview(store, enrichIssueKey)
+		return interactiveEnrichReview(store, enrichIssueKey, enrichFilter)
 	default:
 		return runEnrichAgent(store)
 	}
@@ -757,9 +763,34 @@ func parseEnrichmentResponse(text string) *storage.Enrichment {
 	}
 }
 
+// === Reject unknown ===
+
+func rejectUnknownEnrichments(store *storage.Store) error {
+	issues, err := store.GetKeptIssues()
+	if err != nil {
+		return err
+	}
+
+	rejected := 0
+	for _, issue := range issues {
+		if issue.Enrichment != nil && issue.Enrichment.Confidence == "unknown" {
+			issue.Enrichment.Decision = storage.EnrichRejected
+			issue.Enrichment.RejectionReason = "auto-rejected: unknown confidence (unparseable agent response)"
+			if err := store.SaveStoredIssue(issue); err != nil {
+				return fmt.Errorf("failed to save %s: %w", issue.Issue.Key, err)
+			}
+			fmt.Printf("  rejected %s\n", issue.Issue.Key)
+			rejected++
+		}
+	}
+
+	fmt.Printf("\nRejected %d issues with unknown confidence.\n", rejected)
+	return showEnrichStatus(store)
+}
+
 // === Interactive review ===
 
-func interactiveEnrichReview(store *storage.Store, issueKey string) error {
+func interactiveEnrichReview(store *storage.Store, issueKey, filterDecision string) error {
 	var toReview []*storage.StoredIssue
 
 	if issueKey != "" {
@@ -776,10 +807,27 @@ func interactiveEnrichReview(store *storage.Store, issueKey string) error {
 		if err != nil {
 			return err
 		}
+
+		// Determine which decisions to show
+		var wantDecisions map[storage.EnrichDecision]bool
+		if filterDecision != "" {
+			d := storage.EnrichDecision(filterDecision)
+			switch d {
+			case storage.EnrichPending, storage.EnrichAccepted, storage.EnrichRejected, storage.EnrichDeferred:
+				wantDecisions = map[storage.EnrichDecision]bool{d: true}
+			default:
+				return fmt.Errorf("unknown filter %q — use: pending, accepted, rejected, deferred", filterDecision)
+			}
+		} else {
+			// Default: show pending + deferred
+			wantDecisions = map[storage.EnrichDecision]bool{
+				storage.EnrichPending:  true,
+				storage.EnrichDeferred: true,
+			}
+		}
+
 		for _, issue := range issues {
-			if issue.Enrichment != nil &&
-				(issue.Enrichment.Decision == storage.EnrichPending ||
-					issue.Enrichment.Decision == storage.EnrichDeferred) {
+			if issue.Enrichment != nil && wantDecisions[issue.Enrichment.Decision] {
 				toReview = append(toReview, issue)
 			}
 		}
@@ -794,7 +842,11 @@ func interactiveEnrichReview(store *storage.Store, issueKey string) error {
 		return toReview[i].Issue.Key < toReview[j].Issue.Key
 	})
 
-	fmt.Printf("Found %d enrichments to review.\n", len(toReview))
+	filterLabel := "pending+deferred"
+	if filterDecision != "" {
+		filterLabel = filterDecision
+	}
+	fmt.Printf("Found %d enrichments to review (filter: %s).\n", len(toReview), filterLabel)
 	fmt.Println("Commands: [a]ccept [r]eject [d]efer [v]iew-full [q]uit [?]help")
 	fmt.Println()
 
