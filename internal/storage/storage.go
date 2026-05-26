@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/fraud-zero/screwjira/internal/jira"
+	"github.com/panamafrancis/screwjira/internal/jira"
 )
 
 // Store manages local storage of Jira issues

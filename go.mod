@@ -1,4 +1,4 @@
-module github.com/fraud-zero/screwjira
+module github.com/panamafrancis/screwjira
 
 go 1.25.3
 

@@ -19,11 +19,11 @@ import (
 	"io"
 
 	"github.com/chzyer/readline"
-	"github.com/fraud-zero/screwjira/internal/claude"
-	"github.com/fraud-zero/screwjira/internal/codex"
-	"github.com/fraud-zero/screwjira/internal/config"
-	"github.com/fraud-zero/screwjira/internal/index"
-	"github.com/fraud-zero/screwjira/internal/storage"
+	"github.com/panamafrancis/screwjira/internal/claude"
+	"github.com/panamafrancis/screwjira/internal/codex"
+	"github.com/panamafrancis/screwjira/internal/config"
+	"github.com/panamafrancis/screwjira/internal/index"
+	"github.com/panamafrancis/screwjira/internal/storage"
 	"github.com/spf13/cobra"
 )
 

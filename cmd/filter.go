@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/fraud-zero/screwjira/internal/storage"
+	"github.com/panamafrancis/screwjira/internal/storage"
 	"github.com/spf13/cobra"
 )
 
@@ -359,8 +359,6 @@ func openInBrowser(key string) {
 	cmd.Run()
 }
 
-// jiraSiteURL reads the acli jira config and returns the site hostname for the
-// current profile (e.g. "fraud0.atlassian.net").
 // parseJiraConfig parses the current cloud_id and site from acli's jira_config.yaml.
 func parseJiraConfig() (cloudID, site string) {
 	home, err := os.UserHomeDir()

@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/fraud-zero/screwjira/internal/config"
-	"github.com/fraud-zero/screwjira/internal/index"
+	"github.com/panamafrancis/screwjira/internal/config"
+	"github.com/panamafrancis/screwjira/internal/index"
 	"github.com/spf13/cobra"
 )
 

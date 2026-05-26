@@ -185,7 +185,7 @@ Repo paths live in `~/.screwjira/config.toml`:
 ```toml
 [enrich]
 repos = [
-  "~/code/go/src/github.com/fraud-zero/keystone-api/",
+  "~/code/go/src/github.com/panamafrancis/keystone-api/",
 ]
 model = "sonnet"
 max_turns = 10
@@ -294,7 +294,7 @@ jpd:
 
 github:
   token: ${GITHUB_TOKEN}
-  org: fraud-zero
+  org: panamafrancis
   projects:
     engineering:
       id: 123

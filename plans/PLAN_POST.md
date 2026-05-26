@@ -15,11 +15,11 @@ Add a `[post]` section and a `[user_map]` table:
 ```toml
 [post]
 # Target GitHub repo (owner/name)
-repo = "fraud-zero/keystone"
+repo = "panamafrancis/keystone"
 
 # Optional: GitHub Project v2 number to add issues to
 # project_number = 12
-# project_owner  = "fraud-zero"
+# project_owner  = "panamafrancis"
 
 # Optional: label added to every migrated issue
 # migration_label = "from-jira"
@@ -116,7 +116,7 @@ Body footer always appended:
 
 ```
 ---
-*Migrated from Jira: [KEY](https://fraud0.atlassian.net/browse/KEY) · Created: 2023-04-12 · Reporter: Stefan Koshiw*
+*Migrated from Jira: [KEY](https://yourorg.atlassian.net/browse/KEY) · Created: 2023-04-12 · Reporter: Stefan Koshiw*
 ```
 
 `Issue.Created()` returns an RFC3339 string — format as `2006-01-02` for readability.
@@ -214,15 +214,15 @@ avoids the partial-state problem where some issues are created but not board-add
        Labels:  feature, api
        Assignee: (none)
 
-42 issues would be created in fraud-zero/keystone.
+42 issues would be created in panamafrancis/keystone.
 Run with --apply to create them.
 ```
 
 ### Apply output
 
 ```
-[1/42] F0-123 → https://github.com/fraud-zero/keystone/issues/1
-[2/42] DISC-7 → https://github.com/fraud-zero/keystone/issues/2
+[1/42] F0-123 → https://github.com/panamafrancis/keystone/issues/1
+[2/42] DISC-7 → https://github.com/panamafrancis/keystone/issues/2
 ...
 Done. 42 created, 0 failed.
 ```
@@ -247,7 +247,7 @@ Jira returns attachment metadata in `fields.attachment`:
   "id": "12345",
   "filename": "screenshot.png",
   "mimeType": "image/png",
-  "content": "https://fraud0.atlassian.net/rest/api/2/attachment/content/12345",
+  "content": "https://yourorg.atlassian.net/rest/api/2/attachment/content/12345",
   "size": 98304
 }]
 ```
@@ -385,7 +385,7 @@ After `gh project item-add`, set the status field value via `gh api graphql`:
 **Step 1** (once per run): query the project's "Status" field ID and option IDs:
 ```graphql
 query {
-  organization(login: "fraud-zero") {
+  organization(login: "panamafrancis") {
     projectV2(number: 12) {
       id
       fields(first: 20) {

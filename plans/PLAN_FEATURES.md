@@ -71,7 +71,7 @@ Scans all stored issues, returns those where `Issue.ParentKey() == parentKey`.
 
 Add `docs_repo` to `[enrich]` in `config.toml`:
 ```toml
-docs_repo = "~/code/github.com/fraud-zero/docs"
+docs_repo = "~/code/github.com/panamafrancis/docs"
 ```
 Used to restrict the agent to docs files only in light mode. Optional; if absent, light mode
 uses no tools (agent answers from provided context only).

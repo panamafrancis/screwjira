@@ -6,7 +6,7 @@ import (
 	"strings"
 
 	"github.com/chzyer/readline"
-	"github.com/fraud-zero/screwjira/internal/storage"
+	"github.com/panamafrancis/screwjira/internal/storage"
 	"github.com/spf13/cobra"
 )
 

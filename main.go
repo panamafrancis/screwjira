@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	"github.com/fraud-zero/screwjira/cmd"
+	"github.com/panamafrancis/screwjira/cmd"
 )
 
 func main() {

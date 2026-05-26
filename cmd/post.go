@@ -21,8 +21,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/fraud-zero/screwjira/internal/config"
-	"github.com/fraud-zero/screwjira/internal/storage"
+	"github.com/panamafrancis/screwjira/internal/config"
+	"github.com/panamafrancis/screwjira/internal/storage"
 	"github.com/spf13/cobra"
 )
 
