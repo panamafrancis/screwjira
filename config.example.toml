@@ -1,0 +1,117 @@
+# screwjira configuration example
+# Copy to ~/.screwjira/config.toml and fill in your values.
+
+
+# ---------------------------------------------------------------------------
+# Jira projects
+# ---------------------------------------------------------------------------
+# One [[projects]] block per Jira project you want to migrate.
+# Run "screwjira ingest --all" to pull all configured projects, or
+# "screwjira ingest --project ENG" to pull a single one.
+
+[[projects]]
+key  = "ENG"
+name = "Engineering"                       # display name — used in status output
+jql  = "project = \"ENG\" AND status NOT IN (\"Done\", \"Won't Do\") ORDER BY created ASC"
+exclude_statuses = ["Done", "Won't Do"]    # issues moving to these statuses are auto-skipped on sync
+
+# Optional: if your team uses a Jira Product Discovery (JPD) project, add it
+# here with light_mode_type set to the JPD issue type that represents ideas.
+# The enrichment agent will use a lighter, docs-only prompt for those issues
+# instead of scanning source code.
+#
+# collapse_child_type: when --collapse-epics is used with "screwjira normalize",
+# kept child issues of this type whose parent is a kept light_mode_type issue
+# are automatically skipped — they'll be summarised inside the parent instead
+# of becoming separate GitHub issues.
+
+# [[projects]]
+# key  = "DISC"
+# name = "Discovery (JPD)"
+# jql  = "project = \"DISC\" AND status NOT IN (\"Released\", \"Abandoned\") ORDER BY created ASC"
+# exclude_statuses    = ["Released", "Abandoned"]
+# light_mode_type     = "Idea"    # Idea issues use docs-only light enrichment
+# collapse_child_type = "Epic"    # Epic children of a kept Idea are collapsed into it
+
+
+# ---------------------------------------------------------------------------
+# Atlassian
+# ---------------------------------------------------------------------------
+# Your Atlassian Cloud URL. Used in the "Migrated from Jira" footer link on
+# every GitHub issue. If not set, screwjira tries to read it from acli's config.
+
+jira_url = "https://your-org.atlassian.net"
+
+
+# ---------------------------------------------------------------------------
+# Enrichment
+# ---------------------------------------------------------------------------
+[enrich]
+
+# Which AI agent to use for enrichment. "claude" or "codex".
+# If the primary agent hits a rate limit, screwjira falls back to the other.
+agent = "claude"
+
+# Local paths to the codebases the agent should search for context.
+# Supports ~/ expansion. Add every repo whose code is likely referenced in tickets.
+repos = [
+  "~/code/your-api/",
+  "~/code/your-frontend/",
+]
+
+# Optional: a docs-only repo used for light-mode enrichment (JPD ideas).
+# The agent reads this repo but does not scan source code.
+# docs_repo = "~/code/docs/"
+
+# Model to use per agent. These are the recommended defaults.
+claude_model = "claude-sonnet-4-6"
+codex_model  = "o3"
+
+# Maximum agent turns per issue (claude only). Higher values give the agent
+# more time to search the codebase but cost more. Default: 5.
+max_turns = 5
+
+# Number of issues to enrich in parallel. Start at 1 and raise carefully —
+# higher values can trigger agent rate limits. Default: 1.
+# parallel = 3
+
+
+# ---------------------------------------------------------------------------
+# Posting to GitHub
+# ---------------------------------------------------------------------------
+[post]
+
+# Target GitHub repository for created issues (owner/repo format).
+repo = "your-org/your-repo"
+
+# Optional: GitHub Projects v2 board to add issues to.
+# Find the project number in the URL: github.com/orgs/ORG/projects/NUMBER
+# project_number = 5
+# project_owner  = "your-org"
+
+# Optional: label applied to every migrated issue so you can filter by source.
+# migration_label = "from-jira"
+
+# Optional: number of issues to post in parallel. Keep this at 2–3 to avoid
+# GitHub's secondary rate limit on content creation. Default: 1.
+# parallel = 2
+
+# Map Jira workflow statuses to your GitHub Project column names.
+# Keys are Jira status names in lowercase; values are GitHub Project status values.
+[post.status_map]
+"to do"       = "Backlog"
+"in progress" = "In Progress"
+"review"      = "Review"
+"blocked"     = "Blocked"
+# "done"      = "Done"    # usually excluded by jql, but add if needed
+
+
+# ---------------------------------------------------------------------------
+# User mapping
+# ---------------------------------------------------------------------------
+# Maps Jira display names (lowercase) to GitHub usernames.
+# Used to @-mention the original reporter in migrated issues.
+# Set to "n/a" to skip a user.
+[user_map]
+# "jane doe"    = "janedoe"
+# "john smith"  = "jsmith"

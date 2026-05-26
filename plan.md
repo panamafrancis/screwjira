@@ -1,4 +1,4 @@
-# fuckjira - Jira to GitHub Projects Migration Tool
+# screwjira - Jira to GitHub Projects Migration Tool
 
 ## Overview
 
@@ -22,7 +22,7 @@ Both projects are accessible via standard `acli jira workitem search --jql=...` 
 └─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
        │                   │                   │                   │
        ▼                   ▼                   ▼                   ▼
-   ~/.fuckjira/        Terminal          ~/.fuckjira/         GitHub API
+   ~/.screwjira/        Terminal          ~/.screwjira/         GitHub API
    raw/*.json          prompts           enriched/*.json      Projects
 ```
 
@@ -45,7 +45,7 @@ Dump all Jira/JPD data locally for offline processing.
 
 ### Storage Structure
 ```
-~/.fuckjira/
+~/.screwjira/
 ├── config.yaml           # API credentials, project mappings
 ├── raw/
 │   ├── jira/
@@ -62,10 +62,10 @@ Dump all Jira/JPD data locally for offline processing.
 
 ### Commands
 ```bash
-fuckjira ingest --source jira --project PROJ    # Single project
-fuckjira ingest --source jira --all             # All accessible projects
-fuckjira ingest --source jpd --project PROD     # JPD project
-fuckjira ingest --status                        # Show ingestion stats
+screwjira ingest --source jira --project PROJ    # Single project
+screwjira ingest --source jira --all             # All accessible projects
+screwjira ingest --source jpd --project PROD     # JPD project
+screwjira ingest --status                        # Show ingestion stats
 ```
 
 ## Phase 2: Interactive Filtering
@@ -74,7 +74,7 @@ Given ~300 issues with significant rot, interactive triage is essential.
 
 ### Triage Workflow
 ```bash
-fuckjira filter --start                         # Begin interactive session
+screwjira filter --start                         # Begin interactive session
 ```
 
 For each issue, display:
@@ -94,10 +94,10 @@ Prompt for action:
 
 ### Bulk Operations
 ```bash
-fuckjira filter --by-status "Won't Do"          # Auto-skip closed-as-wontdo
-fuckjira filter --by-age 365                    # Flag issues >1 year untouched
-fuckjira filter --by-assignee departed@co.com   # Flag ex-employee issues
-fuckjira filter --resume                        # Continue where you left off
+screwjira filter --by-status "Won't Do"          # Auto-skip closed-as-wontdo
+screwjira filter --by-age 365                    # Flag issues >1 year untouched
+screwjira filter --by-assignee departed@co.com   # Flag ex-employee issues
+screwjira filter --resume                        # Continue where you left off
 ```
 
 ### Output
@@ -119,9 +119,9 @@ Scan all kept issues and recommend labels for grouping them.
 - Interactive review: approve/reject/edit label assignments in bulk
 
 ```bash
-fuckjira classify labels                        # Analyze and propose label scheme
-fuckjira classify labels --apply                # Apply approved label assignments
-fuckjira classify labels --dry-run              # Preview assignments
+screwjira classify labels                        # Analyze and propose label scheme
+screwjira classify labels --apply                # Apply approved label assignments
+screwjira classify labels --dry-run              # Preview assignments
 ```
 
 ### 3a.2: Type Reclassification
@@ -134,8 +134,8 @@ Correctly categorize issues as `task`, `bug`, or `idea`:
 - Interactive review for ambiguous cases
 
 ```bash
-fuckjira classify types                         # Analyze and propose type changes
-fuckjira classify types --apply                 # Apply approved reclassifications
+screwjira classify types                         # Analyze and propose type changes
+screwjira classify types --apply                 # Apply approved reclassifications
 ```
 
 ### 3a.3: Epic -> Idea Conversion & Duplicate Merging
@@ -149,15 +149,15 @@ Epics in Jira were just used to group tasks and relate them to JPD ideas. Conver
 - Children get an `epic_parent` link to their parent idea
 
 ```bash
-fuckjira classify epics                         # Show epics, detect duplicates with DISC
-fuckjira classify epics --apply                 # Convert to ideas, merge duplicates
+screwjira classify epics                         # Show epics, detect duplicates with DISC
+screwjira classify epics --apply                 # Convert to ideas, merge duplicates
 ```
 
 ### Storage
 
 Classification results stored alongside filtered data:
 ```
-~/.fuckjira/
+~/.screwjira/
 ├── classified/
 │   ├── labels.json          # Proposed label scheme + assignments
 │   ├── types.json           # Reclassification decisions
@@ -171,7 +171,7 @@ A Claude agent processes issues off a queue, scanning **local** repositories to 
 ### Architecture
 ```
 ┌──────────────┐     ┌─────────────────┐     ┌──────────────┐
-│  fuckjira    │────>│  claude agent    │────>│  local repos │
+│  screwjira    │────>│  claude agent    │────>│  local repos │
 │  (queue mgr) │<────│  (retained ctx) │     │  (Glob/Grep/ │
 │              │     │                 │     │   Read)       │
 └──────────────┘     └─────────────────┘     └──────────────┘
@@ -181,7 +181,7 @@ A Claude agent processes issues off a queue, scanning **local** repositories to 
 ```
 
 ### Configuration
-Repo paths live in `~/.fuckjira/config.toml`:
+Repo paths live in `~/.screwjira/config.toml`:
 ```toml
 [enrich]
 repos = [
@@ -192,19 +192,19 @@ max_turns = 10
 ```
 
 ### How It Works
-1. `fuckjira enrich` starts a Claude session with system context (repo paths)
+1. `screwjira enrich` starts a Claude session with system context (repo paths)
 2. Feeds un-enriched kept issues one at a time via `claude --resume`
 3. Agent searches repos using Glob/Grep/Read tools, returns structured JSON
-4. `fuckjira` saves enrichment to the issue and moves to the next
+4. `screwjira` saves enrichment to the issue and moves to the next
 5. Session ID is persisted — re-running continues the same agent context
 
 ### Commands
 ```bash
-fuckjira enrich                    # Process all un-enriched kept issues
-fuckjira enrich --issue F0-123     # Single issue
-fuckjira enrich --limit 10         # Process 10 issues
-fuckjira enrich --status           # Show enrichment progress
-fuckjira enrich --reset            # Re-enrich already enriched issues
+screwjira enrich                    # Process all un-enriched kept issues
+screwjira enrich --issue F0-123     # Single issue
+screwjira enrich --limit 10         # Process 10 issues
+screwjira enrich --status           # Show enrichment progress
+screwjira enrich --reset            # Re-enrich already enriched issues
 ```
 
 ### Output Per Issue
@@ -263,12 +263,12 @@ Create issues in GitHub Projects with full context.
 
 ### Commands
 ```bash
-fuckjira post --dry-run                         # Preview what would be created
-fuckjira post --project engineering             # Post to engineering project
-fuckjira post --project product                 # Post to product project
-fuckjira post --issue PROJECT-123               # Single issue
-fuckjira post --batch 20                        # Post 20 issues
-fuckjira post --status                          # Show post progress
+screwjira post --dry-run                         # Preview what would be created
+screwjira post --project engineering             # Post to engineering project
+screwjira post --project product                 # Post to product project
+screwjira post --issue PROJECT-123               # Single issue
+screwjira post --batch 20                        # Post 20 issues
+screwjira post --status                          # Show post progress
 ```
 
 ### Idempotency
@@ -279,7 +279,7 @@ fuckjira post --status                          # Show post progress
 ## Configuration
 
 ```yaml
-# ~/.fuckjira/config.yaml
+# ~/.screwjira/config.yaml
 jira:
   url: https://company.atlassian.net
   email: user@company.com
@@ -326,7 +326,7 @@ mappings:
 1. [ ] CLI skeleton with cobra
 2. [ ] Config loading (viper)
 3. [ ] `acli` wrapper (execute + parse JSON output)
-4. [ ] Local storage layer (read/write JSON to ~/.fuckjira)
+4. [ ] Local storage layer (read/write JSON to ~/.screwjira)
 5. [ ] `ingest` command - shell out to acli for issues, comments, attachments
 
 ### Milestone 2: Filtering
@@ -420,45 +420,45 @@ This means:
 
 ```bash
 # 1. Setup
-fuckjira init                                   # Create config template
-vim ~/.fuckjira/config.yaml                     # Fill in credentials
+screwjira init                                   # Create config template
+vim ~/.screwjira/config.yaml                     # Fill in credentials
 
 # 2. Ingest everything
-fuckjira ingest --source jira --all
-fuckjira ingest --source jpd --all
-fuckjira ingest --status
+screwjira ingest --source jira --all
+screwjira ingest --source jpd --all
+screwjira ingest --status
 # "Ingested 347 issues (312 Jira, 35 JPD)"
 
 # 3. Bulk filter obvious cases
-fuckjira filter --by-status "Won't Do"          # Auto-skip 42 issues
-fuckjira filter --by-age 730                    # Flag 67 issues >2 years old
+screwjira filter --by-status "Won't Do"          # Auto-skip 42 issues
+screwjira filter --by-age 730                    # Flag 67 issues >2 years old
 
 # 4. Interactive triage
-fuckjira filter --start
+screwjira filter --start
 # ... work through remaining ~240 issues ...
 # "Kept: 180, Skipped: 52, Deferred: 8"
 
 # 5. Classify
-fuckjira classify labels                        # Propose label scheme
-fuckjira classify labels --apply                # Apply labels
-fuckjira classify types                         # Reclassify task/bug/idea
-fuckjira classify types --apply                 # Apply types
-fuckjira classify epics --apply                 # Convert to ideas, merge duplicates
+screwjira classify labels                        # Propose label scheme
+screwjira classify labels --apply                # Apply labels
+screwjira classify types                         # Reclassify task/bug/idea
+screwjira classify types --apply                 # Apply types
+screwjira classify epics --apply                 # Convert to ideas, merge duplicates
 # "Classified 180 issues: 95 tasks, 40 bugs, 45 ideas. Dissolved 12 epics."
 
 # 6. Enrich (Claude agent scans local repos)
-vim ~/.fuckjira/config.toml                     # Add repo paths
-fuckjira enrich
+vim ~/.screwjira/config.toml                     # Add repo paths
+screwjira enrich
 # Agent processes issues with retained context, scanning repos
 # "Enriched 180 issues: 67 high, 45 medium, 38 low, 30 none"
 
 # 7. Post
-fuckjira post --dry-run --project engineering
-fuckjira post --project engineering
-fuckjira post --project product
+screwjira post --dry-run --project engineering
+screwjira post --project engineering
+screwjira post --project product
 # "Posted 156 to engineering, 24 to product"
 
 # 8. Verify
-fuckjira post --status
+screwjira post --status
 # Shows mapping of Jira -> GitHub issues
 ```

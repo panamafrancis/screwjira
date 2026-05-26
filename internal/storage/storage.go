@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/fraud-zero/fuckjira/internal/jira"
+	"github.com/fraud-zero/screwjira/internal/jira"
 )
 
 // Store manages local storage of Jira issues
@@ -60,6 +60,23 @@ type Enrichment struct {
 	RejectionReason string         `json:"rejection_reason,omitempty"`
 }
 
+// PostedState records the GitHub issue created for a stored issue.
+type PostedState struct {
+	IssueNumber int    `json:"issue_number"`
+	IssueURL    string `json:"issue_url"`
+	PostedAt    string `json:"posted_at"` // RFC3339
+}
+
+// GoldVerdict records whether a post-enrichment classifier judged that the
+// agent found a real bug or fix during enrichment. Set by the `gold` command.
+type GoldVerdict struct {
+	IsGold     bool     `json:"is_gold"`
+	Reason     string   `json:"reason"`
+	Evidence   []string `json:"evidence,omitempty"`
+	Model      string   `json:"model,omitempty"`
+	ReviewedAt string   `json:"reviewed_at"` // RFC3339
+}
+
 // StoredIssue wraps a Jira issue with filter metadata
 type StoredIssue struct {
 	Issue          *jira.Issue     `json:"issue"`
@@ -67,27 +84,38 @@ type StoredIssue struct {
 	Reason         string          `json:"reason,omitempty"`
 	Classification *Classification `json:"classification,omitempty"`
 	Enrichment     *Enrichment     `json:"enrichment,omitempty"`
+	EnrichMode     string          `json:"enrich_mode,omitempty"` // "light" for DISC Ideas
+	Gold           *GoldVerdict    `json:"gold,omitempty"`
+	Posted         *PostedState    `json:"posted,omitempty"`
+}
+
+// writeFileAtomic writes data to path via a temp file + rename so concurrent
+// readers never observe a partial write.
+func writeFileAtomic(path string, data []byte) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // New creates a new Store
 func New(baseDir string) (*Store, error) {
-	dirs := []string{
-		filepath.Join(baseDir, "raw", "F0"),
-		filepath.Join(baseDir, "raw", "DISC"),
+	for _, dir := range []string{
+		filepath.Join(baseDir, "raw"),
 		filepath.Join(baseDir, "filtered"),
 		filepath.Join(baseDir, "classified"),
-	}
-
-	for _, dir := range dirs {
+	} {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return nil, fmt.Errorf("failed to create directory %s: %w", dir, err)
 		}
 	}
-
 	return &Store{baseDir: baseDir}, nil
 }
 
-// SaveIssue saves an issue to the raw directory
+// SaveIssue saves an issue to the raw directory. If the issue already exists,
+// its Jira fields are updated but Decision, Reason, Classification, and
+// Enrichment are preserved.
 func (s *Store) SaveIssue(issue *jira.Issue) error {
 	project := issue.Project()
 	if project == "" {
@@ -99,10 +127,11 @@ func (s *Store) SaveIssue(issue *jira.Issue) error {
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	stored := StoredIssue{
-		Issue:    issue,
-		Decision: DecisionPending,
+	stored, err := s.LoadIssue(issue.Key)
+	if err != nil {
+		stored = &StoredIssue{Decision: DecisionPending}
 	}
+	stored.Issue = issue
 
 	data, err := json.MarshalIndent(stored, "", "  ")
 	if err != nil {
@@ -110,7 +139,7 @@ func (s *Store) SaveIssue(issue *jira.Issue) error {
 	}
 
 	path := filepath.Join(dir, issue.Key+".json")
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	if err := writeFileAtomic(path, data); err != nil {
 		return fmt.Errorf("failed to write issue: %w", err)
 	}
 
@@ -154,7 +183,7 @@ func (s *Store) UpdateDecision(key string, decision FilterDecision, reason strin
 		return fmt.Errorf("failed to marshal issue: %w", err)
 	}
 
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	if err := writeFileAtomic(path, data); err != nil {
 		return fmt.Errorf("failed to write issue: %w", err)
 	}
 
@@ -271,6 +300,28 @@ func (s *Store) GetPendingIssues() ([]*StoredIssue, error) {
 	return pending, nil
 }
 
+// GetIssuesByDecision returns issues matching any of the given decisions.
+func (s *Store) GetIssuesByDecision(decisions []FilterDecision) ([]*StoredIssue, error) {
+	issues, err := s.ListAllIssues()
+	if err != nil {
+		return nil, err
+	}
+
+	set := make(map[FilterDecision]struct{}, len(decisions))
+	for _, d := range decisions {
+		set[d] = struct{}{}
+	}
+
+	var result []*StoredIssue
+	for _, issue := range issues {
+		if _, ok := set[issue.Decision]; ok {
+			result = append(result, issue)
+		}
+	}
+
+	return result, nil
+}
+
 // GetKeptIssues returns issues marked as keep
 func (s *Store) GetKeptIssues() ([]*StoredIssue, error) {
 	issues, err := s.ListAllIssues()
@@ -305,7 +356,7 @@ func (s *Store) SaveStoredIssue(stored *StoredIssue) error {
 		return fmt.Errorf("failed to marshal issue: %w", err)
 	}
 
-	return os.WriteFile(filepath.Join(dir, stored.Issue.Key+".json"), data, 0644)
+	return writeFileAtomic(filepath.Join(dir, stored.Issue.Key+".json"), data)
 }
 
 // SaveProposal saves a classification proposal to the classified/ directory
@@ -336,6 +387,40 @@ func (s *Store) LoadProposal(name string, target interface{}) error {
 // ClassifiedDir returns the path to the classified directory
 func (s *Store) ClassifiedDir() string {
 	return filepath.Join(s.baseDir, "classified")
+}
+
+// GetUpgradeableIssues returns kept issues that were enriched with low or no
+// confidence, suitable for a second pass with a more capable model.
+func (s *Store) GetUpgradeableIssues() ([]*StoredIssue, error) {
+	issues, err := s.GetKeptIssues()
+	if err != nil {
+		return nil, err
+	}
+
+	var result []*StoredIssue
+	for _, issue := range issues {
+		if issue.Enrichment != nil &&
+			(issue.Enrichment.Confidence == "low" || issue.Enrichment.Confidence == "none") {
+			result = append(result, issue)
+		}
+	}
+
+	return result, nil
+}
+
+// GetChildIssues returns all stored issues whose parent key matches parentKey.
+func (s *Store) GetChildIssues(parentKey string) ([]*StoredIssue, error) {
+	all, err := s.ListAllIssues()
+	if err != nil {
+		return nil, err
+	}
+	var children []*StoredIssue
+	for _, issue := range all {
+		if issue.Issue.ParentKey() == parentKey {
+			children = append(children, issue)
+		}
+	}
+	return children, nil
 }
 
 // GetEnrichableIssues returns kept issues that need enrichment: either not yet

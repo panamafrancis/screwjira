@@ -5,12 +5,13 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/fraud-zero/fuckjira/internal/storage"
+	"github.com/fraud-zero/screwjira/internal/storage"
 	"github.com/spf13/cobra"
 )
 
@@ -144,7 +145,7 @@ func showFilterStatus(store *storage.Store) error {
 	fmt.Printf("  Defer:   %d\n", stats.Defer)
 
 	if stats.Pending > 0 {
-		fmt.Printf("\nRun 'fuckjira filter --start' to begin interactive filtering\n")
+		fmt.Printf("\nRun 'screwjira filter --start' to begin interactive filtering\n")
 	}
 
 	return nil
@@ -220,7 +221,7 @@ func interactiveFilter(store *storage.Store) error {
 			displayIssueFull(issue)
 
 		case "o", "open":
-			openInBrowser(issue.Issue.Self)
+			openInBrowser(issue.Issue.Key)
 
 		case "q", "quit":
 			fmt.Printf("\nSession ended. Kept: %d, Skipped: %d, Deferred: %d\n", kept, skipped, deferred)
@@ -337,9 +338,13 @@ func extractTextFromADF(doc map[string]interface{}) string {
 	return strings.TrimSpace(result)
 }
 
-func openInBrowser(url string) {
-	// Convert API URL to web URL
-	url = strings.Replace(url, "/rest/api/3/issue/", "/browse/", 1)
+func openInBrowser(key string) {
+	site := jiraSiteURL()
+	if site == "" {
+		fmt.Printf("Open in browser: https://your-site.atlassian.net/browse/%s\n", key)
+		return
+	}
+	url := "https://" + site + "/browse/" + key
 
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
@@ -352,6 +357,60 @@ func openInBrowser(url string) {
 		return
 	}
 	cmd.Run()
+}
+
+// jiraSiteURL reads the acli jira config and returns the site hostname for the
+// current profile (e.g. "fraud0.atlassian.net").
+// parseJiraConfig parses the current cloud_id and site from acli's jira_config.yaml.
+func parseJiraConfig() (cloudID, site string) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	data, err := os.ReadFile(filepath.Join(home, ".config", "acli", "jira_config.yaml"))
+	if err != nil {
+		return
+	}
+
+	lines := strings.Split(string(data), "\n")
+
+	// Extract cloud_id from current_profile: <cloud_id>:<rest>
+	for _, line := range lines {
+		if trimmed := strings.TrimSpace(line); strings.HasPrefix(trimmed, "current_profile:") {
+			val := strings.TrimSpace(strings.TrimPrefix(trimmed, "current_profile:"))
+			cloudID = strings.SplitN(val, ":", 2)[0]
+			break
+		}
+	}
+
+	// Walk profiles to find the matching site.
+	// YAML list items are prefixed with "- ", so strip that before matching.
+	var lastSite string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		trimmed = strings.TrimPrefix(trimmed, "- ")
+		if strings.HasPrefix(trimmed, "site:") {
+			lastSite = strings.TrimSpace(strings.TrimPrefix(trimmed, "site:"))
+		} else if strings.HasPrefix(trimmed, "cloud_id:") {
+			cid := strings.TrimSpace(strings.TrimPrefix(trimmed, "cloud_id:"))
+			if cloudID == "" || cid == cloudID {
+				site = lastSite
+				return
+			}
+		}
+	}
+	site = lastSite
+	return
+}
+
+func jiraSiteURL() string {
+	_, site := parseJiraConfig()
+	return site
+}
+
+func jiraCloudID() string {
+	cloudID, _ := parseJiraConfig()
+	return cloudID
 }
 
 func printHelp() {

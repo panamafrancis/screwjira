@@ -135,7 +135,7 @@ func indexTypeScript(repoRoot string) ([]tsExport, error) {
 	}
 
 	// Write script to temp file
-	tmpFile, err := os.CreateTemp("", "fuckjira-ts-index-*.js")
+	tmpFile, err := os.CreateTemp("", "screwjira-ts-index-*.js")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp file: %w", err)
 	}

@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/fraud-zero/fuckjira/internal/config"
-	"github.com/fraud-zero/fuckjira/internal/index"
+	"github.com/fraud-zero/screwjira/internal/config"
+	"github.com/fraud-zero/screwjira/internal/index"
 	"github.com/spf13/cobra"
 )
 
@@ -15,7 +15,7 @@ var indexCmd = &cobra.Command{
 	Use:   "index",
 	Short: "Index local repos for enrichment context",
 	Long: `Analyze configured repositories and generate a compact architecture index.
-The index is saved to ~/.fuckjira/index.md and used as context during enrichment
+The index is saved to ~/.screwjira/index.md and used as context during enrichment
 to eliminate per-issue codebase searches.`,
 	RunE: runIndex,
 }
@@ -82,5 +82,33 @@ func runIndex(cmd *cobra.Command, args []string) error {
 
 	elapsed := time.Since(start).Round(time.Millisecond)
 	fmt.Printf("\nIndex written to %s (%d bytes, %s)\n", outPath, len(markdown), elapsed)
+
+	// Build / refresh glossary
+	glossaryPath := filepath.Join(getDataDir(), "glossary.toml")
+	existing, err := index.LoadGlossary(glossaryPath)
+	if err != nil {
+		fmt.Printf("Warning: failed to load existing glossary: %v\n", err)
+		existing = &index.Glossary{}
+	}
+	// Seed with hardcoded entries on first run (empty file).
+	if len(existing.Terms) == 0 {
+		existing.Terms = index.SeedGlossary()
+	}
+	freshTerms := index.ExtractGlossary(cfg.Enrich.Repos)
+	merged := index.MergeGlossary(existing, freshTerms)
+	if err := index.SaveGlossary(glossaryPath, merged); err != nil {
+		fmt.Printf("Warning: failed to save glossary: %v\n", err)
+	} else {
+		auto, manual := 0, 0
+		for _, t := range merged.Terms {
+			if t.Source == "manual" {
+				manual++
+			} else {
+				auto++
+			}
+		}
+		fmt.Printf("Glossary: %d terms (%d auto, %d manual) written to %s\n", len(merged.Terms), auto, manual, glossaryPath)
+	}
+
 	return nil
 }

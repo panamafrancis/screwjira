@@ -9,8 +9,18 @@ import (
 	"strings"
 )
 
+// MCPServerDef defines a single MCP server to pass via --mcp-config.
+type MCPServerDef struct {
+	Command string   `json:"command"`
+	Args    []string `json:"args,omitempty"`
+}
+
 // ErrRateLimited is returned when claude hits a rate/token limit.
 var ErrRateLimited = errors.New("claude: rate limited")
+
+// ErrMaxTurns is returned when claude hits the max-turns limit.
+// Retrying won't help — the issue needs more turns than configured.
+var ErrMaxTurns = errors.New("claude: max turns reached")
 
 var rateLimitPatterns = []string{
 	"rate_limit",
@@ -80,6 +90,7 @@ type Options struct {
 	AllowedTools []string
 	AddDirs      []string
 	SystemPrompt string
+	MCPServers   map[string]MCPServerDef
 }
 
 // Invoke starts a new claude session with the given prompt
@@ -115,6 +126,12 @@ func buildArgs(prompt string, sessionID string, opts Options) []string {
 	if opts.SystemPrompt != "" {
 		args = append(args, "--system-prompt", opts.SystemPrompt)
 	}
+	if len(opts.MCPServers) > 0 {
+		cfg, err := json.Marshal(map[string]any{"mcpServers": opts.MCPServers})
+		if err == nil {
+			args = append(args, "--mcp-config", string(cfg))
+		}
+	}
 
 	return args
 }
@@ -123,9 +140,21 @@ func run(args []string) (*Response, error) {
 	cmd := exec.Command("claude", args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		// claude exits non-zero for structured errors (e.g. error_max_turns) but
+		// still emits valid JSON. Try to parse it before falling back to raw error.
+		var resp Response
+		if jsonErr := json.Unmarshal(output, &resp); jsonErr == nil && resp.Type == "result" {
+			if resp.Subtype == "error_max_turns" {
+				return &resp, fmt.Errorf("%w (%d turns used, $%.4f)", ErrMaxTurns, resp.NumTurns, resp.TotalCostUSD)
+			}
+			if pattern := rateLimitMatch(resp.Result); pattern != "" {
+				return &resp, fmt.Errorf("%w (matched %q)", ErrRateLimited, pattern)
+			}
+			return &resp, fmt.Errorf("claude error: %s", resp.Result)
+		}
 		combined := strings.TrimSpace(string(output))
-		if isRateLimited(combined) {
-			return nil, ErrRateLimited
+		if pattern := rateLimitMatch(combined); pattern != "" {
+			return nil, fmt.Errorf("%w (matched %q in: %s)", ErrRateLimited, pattern, truncate(combined, 200))
 		}
 		detail := combined
 		if len(detail) > 500 {
@@ -146,7 +175,6 @@ func run(args []string) (*Response, error) {
 
 	var resp Response
 	if err := json.Unmarshal(output, &resp); err != nil {
-		// Truncate output for error message
 		preview := string(output)
 		if len(preview) > 200 {
 			preview = preview[:200] + "..."
@@ -155,8 +183,8 @@ func run(args []string) (*Response, error) {
 	}
 
 	if resp.IsError {
-		if isRateLimited(resp.Result) {
-			return &resp, ErrRateLimited
+		if pattern := rateLimitMatch(resp.Result); pattern != "" {
+			return &resp, fmt.Errorf("%w (matched %q in: %s)", ErrRateLimited, pattern, truncate(resp.Result, 200))
 		}
 		return &resp, fmt.Errorf("claude error: %s", resp.Result)
 	}
@@ -164,12 +192,20 @@ func run(args []string) (*Response, error) {
 	return &resp, nil
 }
 
-func isRateLimited(text string) bool {
+// rateLimitMatch returns the matched pattern if text looks like a rate limit error, or "" otherwise.
+func rateLimitMatch(text string) string {
 	lower := strings.ToLower(text)
 	for _, pattern := range rateLimitPatterns {
 		if strings.Contains(lower, pattern) {
-			return true
+			return pattern
 		}
 	}
-	return false
+	return ""
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }

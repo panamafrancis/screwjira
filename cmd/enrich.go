@@ -1,24 +1,29 @@
 package cmd
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
-	"github.com/fraud-zero/fuckjira/internal/claude"
-	"github.com/fraud-zero/fuckjira/internal/codex"
-	"github.com/fraud-zero/fuckjira/internal/config"
-	"github.com/fraud-zero/fuckjira/internal/storage"
+	"bufio"
+	"io"
+
+	"github.com/chzyer/readline"
+	"github.com/fraud-zero/screwjira/internal/claude"
+	"github.com/fraud-zero/screwjira/internal/codex"
+	"github.com/fraud-zero/screwjira/internal/config"
+	"github.com/fraud-zero/screwjira/internal/index"
+	"github.com/fraud-zero/screwjira/internal/storage"
 	"github.com/spf13/cobra"
 )
 
@@ -28,10 +33,15 @@ var (
 	enrichIssueKey      string
 	enrichLimit         int
 	enrichReset         bool
+	enrichUpgrade       bool
 	enrichAgent         string
+	enrichModel         string
 	enrichParallel      int
 	enrichRejectUnknown bool
 	enrichFilter        string
+	enrichSkipProjects  []string
+	enrichNoLight       bool
+	enrichConfidence    string
 )
 
 var enrichCmd = &cobra.Command{
@@ -49,10 +59,15 @@ func init() {
 	enrichCmd.Flags().StringVar(&enrichIssueKey, "issue", "", "enrich a single issue")
 	enrichCmd.Flags().IntVar(&enrichLimit, "limit", 0, "limit number of issues to process")
 	enrichCmd.Flags().BoolVar(&enrichReset, "reset", false, "re-enrich already enriched issues")
+	enrichCmd.Flags().BoolVar(&enrichUpgrade, "upgrade", false, "re-enrich low/none confidence issues with a stronger model")
 	enrichCmd.Flags().StringVar(&enrichAgent, "agent", "", "agent to use: claude or codex (overrides config)")
+	enrichCmd.Flags().StringVar(&enrichModel, "model", "", "model override for this run (e.g. claude-sonnet-4-6)")
 	enrichCmd.Flags().IntVar(&enrichParallel, "parallel", 0, "concurrent workers (overrides config)")
 	enrichCmd.Flags().BoolVar(&enrichRejectUnknown, "reject-unknown", false, "reject all enrichments with unknown confidence")
 	enrichCmd.Flags().StringVar(&enrichFilter, "filter", "", "filter review by decision: pending, accepted, rejected, deferred")
+	enrichCmd.Flags().StringSliceVar(&enrichSkipProjects, "skip-project", nil, "skip issues from these projects (e.g. --skip-project FOO,BAR)")
+	enrichCmd.Flags().BoolVar(&enrichNoLight, "no-light", false, "disable light mode for discovery issues — use full enrichment instead")
+	enrichCmd.Flags().StringVar(&enrichConfidence, "confidence", "", "filter review by confidence: high, medium, low, none (comma-separated)")
 }
 
 func runEnrich(cmd *cobra.Command, args []string) error {
@@ -67,7 +82,7 @@ func runEnrich(cmd *cobra.Command, args []string) error {
 	case enrichRejectUnknown:
 		return rejectUnknownEnrichments(store)
 	case enrichReview:
-		return interactiveEnrichReview(store, enrichIssueKey, enrichFilter)
+		return interactiveEnrichReview(store, enrichIssueKey, enrichFilter, enrichConfidence)
 	default:
 		return runEnrichAgent(store)
 	}
@@ -88,46 +103,20 @@ func logf(format string, args ...interface{}) {
 	logMu.Unlock()
 }
 
-// setupEscapeListener puts the terminal in cbreak mode and listens for Escape.
-// When Escape is pressed, it cancels the context and closes the channel.
-func setupEscapeListener(cancel context.CancelFunc) (<-chan struct{}, func()) {
-	ch := make(chan struct{}, 1)
-	noop := func() {}
-
-	fi, err := os.Stdin.Stat()
-	if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
-		return ch, noop
-	}
-
-	saved, err := exec.Command("stty", "-g").Output()
-	if err != nil {
-		return ch, noop
-	}
-
-	if err := exec.Command("stty", "cbreak", "-echo").Run(); err != nil {
-		return ch, noop
-	}
-
-	restore := func() {
-		exec.Command("stty", strings.TrimSpace(string(saved))).Run()
-	}
-
+// setupStopListener cancels ctx on the first Ctrl+C (SIGINT).
+// The subprocess (claude/codex) is in the same process group and also receives
+// the signal, so the in-progress agent call will terminate and the loop stops
+// cleanly at the end of the current issue.
+func setupStopListener(cancel context.CancelFunc) func() {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGINT)
 	go func() {
-		buf := make([]byte, 1)
-		for {
-			n, err := os.Stdin.Read(buf)
-			if err != nil || n == 0 {
-				return
-			}
-			if buf[0] == 0x1b { // Escape
-				cancel()
-				ch <- struct{}{}
-				return
-			}
+		if _, ok := <-ch; ok {
+			logf("\nCtrl+C received — stopping after current issue.\n")
+			cancel()
 		}
 	}()
-
-	return ch, restore
+	return func() { signal.Stop(ch); close(ch) }
 }
 
 // agentResult normalizes results from claude and codex into a common shape.
@@ -136,7 +125,9 @@ type agentResult struct {
 	Result           string
 	SessionID        string
 	CostUSD          float64
-	InputTokens      int
+	InputTokens      int // fresh (uncached) input tokens
+	CacheWriteTokens int // tokens written to cache (cache_creation)
+	CacheReadTokens  int // tokens read from cache (cache_read) — cheap
 	OutputTokens     int
 	NumTurns         int
 	ContextRemaining int // -1 if unknown
@@ -159,7 +150,7 @@ func loadIndex(dataDir string) string {
 	}
 
 	if time.Since(info.ModTime()) > 24*time.Hour {
-		logf("Warning: index.md is older than 24 hours. Run 'fuckjira index' to refresh.\n")
+		logf("Warning: index.md is older than 24 hours. Run 'screwjira index' to refresh.\n")
 	}
 
 	data, err := os.ReadFile(indexPath)
@@ -196,6 +187,15 @@ func runEnrichAgent(store *storage.Store) error {
 		return fmt.Errorf("unknown agent %q — must be \"claude\" or \"codex\"", primaryAgent)
 	}
 
+	if enrichModel != "" {
+		switch primaryAgent {
+		case "claude":
+			cfg.Enrich.ClaudeModel = enrichModel
+		case "codex":
+			cfg.Enrich.CodexModel = enrichModel
+		}
+	}
+
 	var toEnrich []*storage.StoredIssue
 
 	if enrichIssueKey != "" {
@@ -209,11 +209,30 @@ func runEnrichAgent(store *storage.Store) error {
 		if err != nil {
 			return err
 		}
+	} else if enrichUpgrade {
+		toEnrich, err = store.GetUpgradeableIssues()
+		if err != nil {
+			return err
+		}
 	} else {
 		toEnrich, err = store.GetEnrichableIssues()
 		if err != nil {
 			return err
 		}
+	}
+
+	if len(enrichSkipProjects) > 0 {
+		skip := make(map[string]bool, len(enrichSkipProjects))
+		for _, p := range enrichSkipProjects {
+			skip[strings.ToUpper(p)] = true
+		}
+		filtered := toEnrich[:0]
+		for _, issue := range toEnrich {
+			if !skip[strings.ToUpper(issue.Issue.Project())] {
+				filtered = append(filtered, issue)
+			}
+		}
+		toEnrich = filtered
 	}
 
 	if len(toEnrich) == 0 {
@@ -234,21 +253,18 @@ func runEnrichAgent(store *storage.Store) error {
 		parallel = enrichParallel
 	}
 
-	// Load index for system prompt
+	// Load index and glossary for system prompt
 	indexContent := loadIndex(getDataDir())
+	glossary := loadGlossary(getDataDir())
 
-	// With index, cap max_turns to avoid expensive over-searching
-	if indexContent != "" && cfg.Enrich.MaxTurns > 3 {
-		cfg.Enrich.MaxTurns = 3
-	}
-
-	systemPrompt := buildEnrichSystemPrompt(cfg.Enrich.Repos, indexContent)
+	systemPrompt := buildEnrichSystemPrompt(cfg.Enrich.Repos, indexContent, glossary)
+	lightSystemPrompt := buildLightEnrichSystemPrompt(cfg.Enrich.DocsRepo, glossary)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	_, restoreTerminal := setupEscapeListener(cancel)
-	defer restoreTerminal()
+	stopListening := setupStopListener(cancel)
+	defer stopListening()
 
 	logf("Enriching %d issues using %d repos (agent: %s [%s], fallback: %s [%s], parallel: %d)...\n",
 		len(toEnrich), len(cfg.Enrich.Repos),
@@ -258,21 +274,26 @@ func runEnrichAgent(store *storage.Store) error {
 	for _, r := range cfg.Enrich.Repos {
 		fmt.Printf("         repo: %s\n", r)
 	}
+	if cfg.Enrich.DocsRepo != "" {
+		fmt.Printf("         docs: %s (light mode for discovery issues)\n", cfg.Enrich.DocsRepo)
+	}
 	if indexContent != "" {
 		fmt.Printf("         index: loaded (%d bytes)\n", len(indexContent))
 	} else {
-		fmt.Printf("         index: not found (run 'fuckjira index' first for faster enrichment)\n")
+		fmt.Printf("         index: not found (run 'screwjira index' first for faster enrichment)\n")
 	}
-	fmt.Printf("         Press Escape to stop after current issue.\n\n")
+	if glossary != "" {
+		fmt.Printf("         glossary: loaded (%d bytes)\n", len(glossary))
+	}
+	fmt.Printf("         Press Ctrl+C to stop after current issue.\n\n")
 
-	hasIndex := indexContent != ""
 	if parallel <= 1 {
-		return runSequential(ctx, store, cfg, toEnrich, primaryAgent, systemPrompt, hasIndex)
+		return runSequential(ctx, store, cfg, toEnrich, primaryAgent, systemPrompt, lightSystemPrompt)
 	}
-	return runParallel(ctx, store, cfg, toEnrich, primaryAgent, systemPrompt, parallel, hasIndex)
+	return runParallel(ctx, store, cfg, toEnrich, primaryAgent, systemPrompt, lightSystemPrompt, parallel)
 }
 
-func runSequential(ctx context.Context, store *storage.Store, cfg *config.Config, toEnrich []*storage.StoredIssue, primaryAgent, systemPrompt string, hasIndex bool) error {
+func runSequential(ctx context.Context, store *storage.Store, cfg *config.Config, toEnrich []*storage.StoredIssue, primaryAgent, systemPrompt, lightSystemPrompt string) error {
 	activeAgent := primaryAgent
 	fallbackAgent := otherAgent(primaryAgent)
 	fallbackAvailable := true
@@ -283,33 +304,49 @@ func runSequential(ctx context.Context, store *storage.Store, cfg *config.Config
 	for i, issue := range toEnrich {
 		select {
 		case <-ctx.Done():
-			logf("Escape pressed — stopping.\n\n")
+			logf("Stopped.\n\n")
 			return showEnrichStatus(store)
 		default:
 		}
-		logf("[%d/%d] %s — %s\n", i+1, len(toEnrich), issue.Issue.Key, truncate(issue.Issue.Summary(), 50))
 
-		issuePrompt := buildIssuePrompt(issue)
+		isLight := isLightModeIssue(issue, cfg)
+		modeTag := ""
+		if isLight {
+			modeTag = " [light]"
+		}
+		logf("[%d/%d] %s — %s%s\n", i+1, len(toEnrich), issue.Issue.Key, truncate(issue.Issue.Summary(), 50), modeTag)
+
+		sysPrompt, issuePrompt := selectPrompts(issue, store, systemPrompt, lightSystemPrompt, isLight)
 		start := time.Now()
 
 		var result *agentResult
 		var err error
 		succeeded := false
+		skipIssue := false
 
 		for attempt := 0; attempt < maxRetries; attempt++ {
+			if ctx.Err() != nil {
+				break
+			}
 			if attempt > 0 {
 				logf("  retry %d/%d...\n", attempt, maxRetries-1)
 			}
 
-			result, err = invokeAgent(activeAgent, cfg, systemPrompt, issuePrompt, hasIndex)
+			result, err = invokeAgent(activeAgent, cfg, sysPrompt, issuePrompt, isLight)
 
 			if err == nil {
 				succeeded = true
 				break
 			}
 
+			if errors.Is(err, claude.ErrMaxTurns) {
+				logf("  max turns reached — skipping: %v\n", err)
+				skipIssue = true
+				break
+			}
+
 			if errors.Is(err, claude.ErrRateLimited) || errors.Is(err, codex.ErrRateLimited) {
-				logf("  %s rate limited\n", activeAgent)
+				logf("  %s rate limited: %v\n", activeAgent, err)
 				if fallbackAvailable {
 					logf("  switching to %s\n", fallbackAgent)
 					activeAgent, fallbackAgent = fallbackAgent, activeAgent
@@ -321,20 +358,35 @@ func runSequential(ctx context.Context, store *storage.Store, cfg *config.Config
 			}
 
 			logf("  Error: %v\n", err)
+			// A crash (signal: killed) won't recover on retry — bail immediately.
+			if strings.Contains(err.Error(), "crashed") {
+				break
+			}
+		}
+
+		if skipIssue {
+			continue
 		}
 
 		if !succeeded {
-			logf("  exiting after %d failed attempts\n\n", maxRetries)
+			if ctx.Err() != nil {
+				logf("  Stopped.\n\n")
+			} else {
+				logf("  exiting after %d failed attempts\n\n", maxRetries)
+			}
 			return showEnrichStatus(store)
 		}
 
 		totalCost += result.CostUSD
-		totalIn += result.InputTokens
+		totalIn += result.InputTokens + result.CacheWriteTokens + result.CacheReadTokens
 		totalOut += result.OutputTokens
 
 		enrichment := parseEnrichmentResponse(result.Result)
 		enrichment.EnrichedBy = result.Agent
 		issue.Enrichment = enrichment
+		if isLight {
+			issue.EnrichMode = "light"
+		}
 		if err := store.SaveStoredIssue(issue); err != nil {
 			return fmt.Errorf("failed to save %s: %w", issue.Issue.Key, err)
 		}
@@ -346,9 +398,12 @@ func runSequential(ctx context.Context, store *storage.Store, cfg *config.Config
 		}
 		logf("  %s — %s%s\n", enrichment.Confidence, truncate(enrichment.Notes, 60), agentTag)
 		if result.CostUSD > 0 {
-			fmt.Printf("         (%d turns, %s, $%.4f, %dk in + %dk out", result.NumTurns, elapsed, result.CostUSD, result.InputTokens/1000, result.OutputTokens/1000)
+			fmt.Printf("         (%d turns, %s, $%.4f — %dk fresh + %dk↑ + %dk↓ in, %dk out",
+				result.NumTurns, elapsed, result.CostUSD,
+				result.InputTokens/1000, result.CacheWriteTokens/1000, result.CacheReadTokens/1000,
+				result.OutputTokens/1000)
 			if result.ContextRemaining >= 0 {
-				fmt.Printf(", %dk remaining", result.ContextRemaining/1000)
+				fmt.Printf(", %dk ctx left", result.ContextRemaining/1000)
 			}
 			fmt.Printf(")\n\n")
 		} else {
@@ -364,7 +419,7 @@ func runSequential(ctx context.Context, store *storage.Store, cfg *config.Config
 	return showEnrichStatus(store)
 }
 
-func runParallel(ctx context.Context, store *storage.Store, cfg *config.Config, toEnrich []*storage.StoredIssue, primaryAgent, systemPrompt string, parallel int, hasIndex bool) error {
+func runParallel(ctx context.Context, store *storage.Store, cfg *config.Config, toEnrich []*storage.StoredIssue, primaryAgent, systemPrompt, lightSystemPrompt string, parallel int) error {
 	sem := make(chan struct{}, parallel)
 	var wg sync.WaitGroup
 
@@ -377,7 +432,7 @@ func runParallel(ctx context.Context, store *storage.Store, cfg *config.Config, 
 	for i, issue := range toEnrich {
 		select {
 		case <-ctx.Done():
-			logf("Escape pressed — waiting for in-flight workers to finish...\n")
+			logf("Ctrl+C — waiting for in-flight workers to finish...\n")
 			wg.Wait()
 			logf("Stopped.\n\n")
 			return showEnrichStatus(store)
@@ -391,12 +446,17 @@ func runParallel(ctx context.Context, store *storage.Store, cfg *config.Config, 
 			defer wg.Done()
 			defer func() { <-sem }() // release semaphore
 
-			logf("[%d/%d] %s — %s\n", idx+1, total, issue.Issue.Key, truncate(issue.Issue.Summary(), 50))
+			isLight := isLightModeIssue(issue, cfg)
+			modeTag := ""
+			if isLight {
+				modeTag = " [light]"
+			}
+			logf("[%d/%d] %s — %s%s\n", idx+1, total, issue.Issue.Key, truncate(issue.Issue.Summary(), 50), modeTag)
 
-			issuePrompt := buildIssuePrompt(issue)
+			sysPrompt, issuePrompt := selectPrompts(issue, store, systemPrompt, lightSystemPrompt, isLight)
 			start := time.Now()
 
-			result, err := invokeWithBackoff(ctx, primaryAgent, cfg, systemPrompt, issuePrompt, hasIndex)
+			result, err := invokeWithBackoff(ctx, primaryAgent, cfg, sysPrompt, issuePrompt, isLight)
 			if err != nil {
 				logf("  %s FAILED: %v\n\n", issue.Issue.Key, err)
 				failed.Add(1)
@@ -406,6 +466,9 @@ func runParallel(ctx context.Context, store *storage.Store, cfg *config.Config, 
 			enrichment := parseEnrichmentResponse(result.Result)
 			enrichment.EnrichedBy = result.Agent
 			issue.Enrichment = enrichment
+			if isLight {
+				issue.EnrichMode = "light"
+			}
 			if err := store.SaveStoredIssue(issue); err != nil {
 				logf("  %s save error: %v\n", issue.Issue.Key, err)
 				failed.Add(1)
@@ -447,7 +510,7 @@ func runParallel(ctx context.Context, store *storage.Store, cfg *config.Config, 
 
 // invokeWithBackoff tries the primary agent with exponential backoff on rate limits.
 // Falls back to the other agent if the primary is rate limited.
-func invokeWithBackoff(ctx context.Context, primaryAgent string, cfg *config.Config, systemPrompt, issuePrompt string, hasIndex bool) (*agentResult, error) {
+func invokeWithBackoff(ctx context.Context, primaryAgent string, cfg *config.Config, systemPrompt, issuePrompt string, lightMode bool) (*agentResult, error) {
 	backoffs := []time.Duration{30 * time.Second, 60 * time.Second, 120 * time.Second}
 	agent := primaryAgent
 
@@ -458,7 +521,7 @@ func invokeWithBackoff(ctx context.Context, primaryAgent string, cfg *config.Con
 		default:
 		}
 
-		result, err := invokeAgent(agent, cfg, systemPrompt, issuePrompt, hasIndex)
+		result, err := invokeAgent(agent, cfg, systemPrompt, issuePrompt, lightMode)
 		if err == nil {
 			return result, nil
 		}
@@ -471,7 +534,7 @@ func invokeWithBackoff(ctx context.Context, primaryAgent string, cfg *config.Con
 		if agent == primaryAgent {
 			fallback := otherAgent(primaryAgent)
 			logf("  %s rate limited, trying %s...\n", agent, fallback)
-			result, err = invokeAgent(fallback, cfg, systemPrompt, issuePrompt, hasIndex)
+			result, err = invokeAgent(fallback, cfg, systemPrompt, issuePrompt, lightMode)
 			if err == nil {
 				return result, nil
 			}
@@ -495,33 +558,38 @@ func invokeWithBackoff(ctx context.Context, primaryAgent string, cfg *config.Con
 	return nil, fmt.Errorf("all retries exhausted (rate limited)")
 }
 
-func invokeAgent(agent string, cfg *config.Config, systemPrompt, issuePrompt string, hasIndex bool) (*agentResult, error) {
+func invokeAgent(agent string, cfg *config.Config, systemPrompt, issuePrompt string, lightMode bool) (*agentResult, error) {
 	switch agent {
 	case "claude":
-		return invokeClaudeAgent(cfg, systemPrompt, issuePrompt, hasIndex)
+		return invokeClaudeAgent(cfg, systemPrompt, issuePrompt, lightMode)
 	case "codex":
-		return invokeCodexAgent(cfg, systemPrompt, issuePrompt)
+		return invokeCodexAgent(cfg, systemPrompt, issuePrompt, lightMode)
 	default:
 		return nil, fmt.Errorf("unknown agent: %s", agent)
 	}
 }
 
-func invokeClaudeAgent(cfg *config.Config, systemPrompt, issuePrompt string, hasIndex bool) (*agentResult, error) {
+func invokeClaudeAgent(cfg *config.Config, systemPrompt, issuePrompt string, lightMode bool) (*agentResult, error) {
 	opts := claude.Options{
 		Model:        cfg.Enrich.ModelFor("claude"),
 		MaxTurns:     cfg.Enrich.MaxTurns,
 		SystemPrompt: systemPrompt,
+		AllowedTools: []string{"Read", "Glob", "Grep", "Bash"},
+		AddDirs:      cfg.Enrich.Repos,
+		MCPServers: map[string]claude.MCPServerDef{
+			"gopls":                      {Command: "gopls", Args: []string{"mcp"}},
+			"typescript-language-server": {Command: "typescript-language-server", Args: []string{"--stdio"}},
+		},
 	}
 
-	if hasIndex {
-		// With index: no tools, no repo access. Agent uses the index in
-		// the system prompt and responds with JSON in a single turn.
-		// Use 3 turns (not 1) because the CLI may consume turns internally.
-		opts.MaxTurns = 3
-	} else {
-		// Without index: give the agent tools to search the codebase.
-		opts.AllowedTools = []string{"Read", "Glob", "Grep", "Bash"}
-		opts.AddDirs = cfg.Enrich.Repos
+	if lightMode {
+		opts.AllowedTools = []string{"Read"}
+		opts.MCPServers = nil
+		if cfg.Enrich.DocsRepo != "" {
+			opts.AddDirs = []string{cfg.Enrich.DocsRepo}
+		} else {
+			opts.AddDirs = nil
+		}
 	}
 
 	resp, err := claude.Invoke(issuePrompt, opts)
@@ -542,17 +610,27 @@ func invokeClaudeAgent(cfg *config.Config, systemPrompt, issuePrompt string, has
 		Result:           resp.Result,
 		SessionID:        resp.SessionID,
 		CostUSD:          resp.TotalCostUSD,
-		InputTokens:      resp.TotalInputTokens(),
+		InputTokens:      resp.Usage.InputTokens,
+		CacheWriteTokens: resp.Usage.CacheCreationInputTokens,
+		CacheReadTokens:  resp.Usage.CacheReadInputTokens,
 		OutputTokens:     resp.TotalOutputTokens(),
 		NumTurns:         resp.NumTurns,
 		ContextRemaining: resp.ContextRemaining(),
 	}, nil
 }
 
-func invokeCodexAgent(cfg *config.Config, systemPrompt, issuePrompt string) (*agentResult, error) {
+func invokeCodexAgent(cfg *config.Config, systemPrompt, issuePrompt string, lightMode bool) (*agentResult, error) {
+	dirs := cfg.Enrich.Repos
+	if lightMode {
+		if cfg.Enrich.DocsRepo != "" {
+			dirs = []string{cfg.Enrich.DocsRepo}
+		} else {
+			dirs = nil
+		}
+	}
 	opts := codex.Options{
 		Model:   cfg.Enrich.ModelFor("codex"),
-		AddDirs: cfg.Enrich.Repos,
+		AddDirs: dirs,
 	}
 
 	prompt := systemPrompt + "\n\n" + issuePrompt
@@ -587,47 +665,40 @@ func invokeCodexAgent(cfg *config.Config, systemPrompt, issuePrompt string) (*ag
 
 // === Prompts ===
 
-func buildEnrichSystemPrompt(repos []string, indexContent string) string {
+func buildEnrichSystemPrompt(repos []string, indexContent string, glossary string) string {
 	var repoList string
 	for _, r := range repos {
 		repoList += fmt.Sprintf("- %s\n", r)
 	}
 
-	hasIndex := indexContent != ""
-
 	var indexSection string
-	var searchInstructions string
-
-	if hasIndex {
+	if indexContent != "" {
 		indexSection = fmt.Sprintf(`
 ## Codebase Architecture Index
 
 The following index contains the full architecture of the repos: packages, exported types,
-functions, services, infrastructure, and file tree. This is your PRIMARY source of information.
+functions, services, infrastructure, and file tree. Use it to orient yourself quickly.
 
 %s
 `, indexContent)
-		searchInstructions = `I will give you Jira issues one at a time. For each issue:
-1. Use the architecture index above to identify relevant packages, types, and files
-2. Read at most 1-2 specific files ONLY if you need exact function signatures or implementation details
-3. DO NOT do broad searches (Glob, Grep) — the index already tells you what exists and where
-4. Propose improvements based on what the index tells you about the codebase structure
-5. Respond IMMEDIATELY with the JSON object once you have enough context — do not over-research`
-	} else {
-		searchInstructions = `I will give you Jira issues one at a time. For each issue:
-1. Search the repos for related code, tests, config, and documentation
-2. Propose an improved title (more specific and actionable)
-3. Propose improved labels based on what you find in the code
-4. Propose a short, focused description grounded in what you find in the codebase`
 	}
+
+	glossarySection := ""
+	if glossary != "" {
+		glossarySection = fmt.Sprintf("\n## Codebase Glossary\n%s\n", glossary)
+	}
+
+	searchInstructions := `I will give you Jira issues one at a time. For each issue:
+1. Use the architecture index (if present) to identify which packages, files, and types are relevant
+2. Explore the actual code — use Read, Grep, Glob, and MCP tools (gopls) freely
+3. If the index includes a markdown (docs) repo, read the relevant doc files for domain context
+4. Propose improvements grounded in what you find in the code, not just the index`
 
 	return fmt.Sprintf(`You are a code enrichment agent helping migrate Jira issues to GitHub.
 
 You have access to these local repositories:
 %s
-IMPORTANT context about the codebase history:
-- The "admin-api" no longer exists and was replaced by the "keystone-api". If an issue references admin-api, treat it as keystone-api.
-- Elasticsearch no longer exists and was replaced by BigQuery. If an issue references Elasticsearch/ES, treat it as BigQuery.
+%s
 %s
 %s
 
@@ -636,7 +707,7 @@ Respond with ONLY a JSON object (no other text, no markdown fences):
   "proposed_title": "Improved, specific title",
   "proposed_labels": ["label1", "label2"],
   "proposed_description": "Short description grounded in codebase findings.",
-  "notes": "Brief explanation of what you found",
+  "notes": "Brief explanation of what you found in the code. Do NOT speculate about why a previous attempt was rejected.",
   "related_files": ["path/to/file.go", "path/to/test.go"],
   "confidence": "high|medium|low|none"
 }
@@ -668,7 +739,127 @@ Other guidelines:
 - proposed_title: Make it specific. "Fix bug" -> "Fix float64 rounding in invoice total"
 - proposed_labels: Use lowercase kebab-case. Include area (billing, auth), type (bug, feature), etc.
 - confidence: "high" = found direct code, "medium" = found related code, "low" = tangential, "none" = nothing found
-- If confidence is "none", keep the original description mostly intact and just clean it up`, repoList, indexSection, searchInstructions)
+- If confidence is "none", keep the original description mostly intact and just clean it up`, repoList, glossarySection, indexSection, searchInstructions)
+}
+
+// isLightModeIssue returns true when the issue's project has light_mode_type configured
+// and the issue's type matches, unless --no-light was passed.
+func isLightModeIssue(issue *storage.StoredIssue, cfg *config.Config) bool {
+	if enrichNoLight {
+		return false
+	}
+	proj := cfg.ProjectByKey(issue.Issue.Project())
+	return proj != nil && proj.LightModeType != "" &&
+		strings.EqualFold(issue.Issue.IssueType(), proj.LightModeType)
+}
+
+// selectPrompts picks the right system/issue prompts based on light mode.
+func selectPrompts(issue *storage.StoredIssue, store *storage.Store, systemPrompt, lightSystemPrompt string, isLight bool) (string, string) {
+	if !isLight {
+		return systemPrompt, buildIssuePrompt(issue)
+	}
+	return lightSystemPrompt, buildHierarchicalIssuePrompt(issue, store)
+}
+
+// buildLightEnrichSystemPrompt builds the system prompt for DISC Idea light enrichment.
+// In light mode the agent does not scan source code — only the docs repo (if configured).
+func buildLightEnrichSystemPrompt(docsRepo string, glossary string) string {
+	glossarySection := ""
+	if glossary != "" {
+		glossarySection = fmt.Sprintf("\n## Codebase Glossary\n%s\n", glossary)
+	}
+
+	repoSection := ""
+	toolInstructions := "You have no repository access. Answer based solely on the provided issue context."
+	if docsRepo != "" {
+		repoSection = fmt.Sprintf("You have access to one documentation repository:\n- %s\n", docsRepo)
+		toolInstructions = "You may Read files from the documentation repository for domain context. Do NOT scan source code."
+	}
+
+	return fmt.Sprintf(`You are a product enrichment agent helping migrate Jira issues to GitHub.
+%s
+%s
+I will give you a product discovery issue. It may include a list of child epics and their tasks.
+Your task is light enrichment — synthesise the hierarchy into a clear feature description:
+1. Write a concise feature description that summarises the idea and its child epics/tasks
+2. Propose a clear, specific title
+3. Suggest appropriate GitHub labels (lowercase kebab-case)
+4. %s
+5. Do NOT scan source code — this is a product-level feature
+
+Respond with ONLY a JSON object (no other text, no markdown fences):
+{
+  "proposed_title": "Improved, specific title",
+  "proposed_labels": ["label1", "label2"],
+  "proposed_description": "Synthesised feature description.",
+  "notes": "Brief explanation of what you found. Do NOT speculate about why a previous attempt was rejected.",
+  "related_files": [],
+  "confidence": "high|medium|low|none"
+}
+
+CRITICAL RULES for proposed_description:
+- Synthesise child epics and tasks into themes — do NOT list every ticket individually
+- Keep it under 300 words
+- End with a "Definition of Done" section (2-4 bullet points)
+- If there are no child epics, improve the existing description with minor clarifications only`, repoSection, glossarySection, toolInstructions)
+}
+
+// buildHierarchicalIssuePrompt builds the issue prompt for a DISC Idea, including
+// a summary of its child epics and their tasks/bugs.
+func buildHierarchicalIssuePrompt(issue *storage.StoredIssue, store *storage.Store) string {
+	base := buildIssuePrompt(issue)
+
+	childEpics, err := store.GetChildIssues(issue.Issue.Key)
+	if err != nil || len(childEpics) == 0 {
+		return base
+	}
+
+	var sb strings.Builder
+	sb.WriteString(base)
+	sb.WriteString("\n\nChild epics and tasks:")
+
+	const maxChars = 4000
+	total := len(base)
+
+	for _, epic := range childEpics {
+		if total >= maxChars {
+			sb.WriteString("\n  (... truncated)")
+			break
+		}
+		line := fmt.Sprintf("\n  Epic %s: %s", epic.Issue.Key, truncate(epic.Issue.Summary(), 80))
+		sb.WriteString(line)
+		total += len(line)
+
+		grandchildren, _ := store.GetChildIssues(epic.Issue.Key)
+		for _, child := range grandchildren {
+			if total >= maxChars {
+				sb.WriteString("\n    (... truncated)")
+				break
+			}
+			line := fmt.Sprintf("\n    - %s (%s): %s", child.Issue.Key, child.Issue.IssueType(), truncate(child.Issue.Summary(), 80))
+			sb.WriteString(line)
+			total += len(line)
+		}
+	}
+
+	return sb.String()
+}
+
+// loadGlossary reads ~/.screwjira/glossary.toml and returns a compact string for the system prompt.
+// Returns "" if the file doesn't exist or on error (not fatal).
+func loadGlossary(dataDir string) string {
+	path := filepath.Join(dataDir, "glossary.toml")
+	g, err := index.LoadGlossary(path)
+	if err != nil || len(g.Terms) == 0 {
+		return ""
+	}
+
+	info, _ := os.Stat(path)
+	if info != nil && time.Since(info.ModTime()) > 24*time.Hour {
+		logf("Warning: glossary.toml is older than 24 hours. Run 'screwjira index' to refresh.\n")
+	}
+
+	return index.RenderGlossaryCompact(g, 2000)
 }
 
 func buildIssuePrompt(issue *storage.StoredIssue) string {
@@ -704,6 +895,12 @@ func buildIssuePrompt(issue *storage.StoredIssue) string {
 	if a := issue.Issue.Assignee(); a != "" {
 		parts = append(parts, fmt.Sprintf("Assignee: %s", a))
 	}
+	if p := issue.Issue.ParentKey(); p != "" {
+		parts = append(parts, fmt.Sprintf("Parent: %s", p))
+	}
+	if links := issue.Issue.IssueLinks(); len(links) > 0 {
+		parts = append(parts, fmt.Sprintf("Linked issues: %s", strings.Join(links, ", ")))
+	}
 
 	if desc := issue.Issue.Description(); desc != "" {
 		if len(desc) > 2000 {
@@ -717,12 +914,14 @@ func buildIssuePrompt(issue *storage.StoredIssue) string {
 		parts = append(parts, "\n⚠️ PREVIOUS ATTEMPT WAS REJECTED.")
 		if issue.Enrichment.RejectionReason != "" {
 			parts = append(parts, fmt.Sprintf("Reviewer feedback: %s", issue.Enrichment.RejectionReason))
+			parts = append(parts, "Please try again, addressing the feedback above.")
+		} else {
+			parts = append(parts, "No specific feedback was provided. Please try again.")
 		}
 		parts = append(parts, fmt.Sprintf("Previous proposed title: %s", issue.Enrichment.ProposedTitle))
 		if len(issue.Enrichment.ProposedLabels) > 0 {
 			parts = append(parts, fmt.Sprintf("Previous proposed labels: %s", strings.Join(issue.Enrichment.ProposedLabels, ", ")))
 		}
-		parts = append(parts, "Please try again, addressing the feedback.")
 	}
 
 	return strings.Join(parts, "\n")
@@ -790,7 +989,7 @@ func rejectUnknownEnrichments(store *storage.Store) error {
 
 // === Interactive review ===
 
-func interactiveEnrichReview(store *storage.Store, issueKey, filterDecision string) error {
+func interactiveEnrichReview(store *storage.Store, issueKey, filterDecision, filterConfidence string) error {
 	var toReview []*storage.StoredIssue
 
 	if issueKey != "" {
@@ -826,10 +1025,31 @@ func interactiveEnrichReview(store *storage.Store, issueKey, filterDecision stri
 			}
 		}
 
-		for _, issue := range issues {
-			if issue.Enrichment != nil && wantDecisions[issue.Enrichment.Decision] {
-				toReview = append(toReview, issue)
+		var wantConfidences map[string]bool
+		if filterConfidence != "" {
+			wantConfidences = make(map[string]bool)
+			for _, c := range strings.Split(filterConfidence, ",") {
+				c = strings.TrimSpace(strings.ToLower(c))
+				switch c {
+				case "high", "medium", "low", "none", "unknown":
+					wantConfidences[c] = true
+				default:
+					return fmt.Errorf("unknown confidence %q — use: high, medium, low, none", c)
+				}
 			}
+		}
+
+		for _, issue := range issues {
+			if issue.Enrichment == nil {
+				continue
+			}
+			if !wantDecisions[issue.Enrichment.Decision] {
+				continue
+			}
+			if wantConfidences != nil && !wantConfidences[issue.Enrichment.Confidence] {
+				continue
+			}
+			toReview = append(toReview, issue)
 		}
 	}
 
@@ -846,12 +1066,16 @@ func interactiveEnrichReview(store *storage.Store, issueKey, filterDecision stri
 	if filterDecision != "" {
 		filterLabel = filterDecision
 	}
+	if filterConfidence != "" {
+		filterLabel += ", confidence=" + filterConfidence
+	}
 	fmt.Printf("Found %d enrichments to review (filter: %s).\n", len(toReview), filterLabel)
-	fmt.Println("Commands: [a]ccept [r]eject [d]efer [v]iew-full [q]uit [?]help")
+	fmt.Println("Commands: [a]ccept [r]eject [d]efer [s]kip [v]iew-full [q]uit [?]help")
 	fmt.Println()
 
 	reader := bufio.NewReader(os.Stdin)
-	accepted, rejected, deferred := 0, 0, 0
+
+	accepted, rejected, deferred, skipped := 0, 0, 0, 0
 
 	for i := 0; i < len(toReview); {
 		issue := toReview[i]
@@ -875,12 +1099,14 @@ func interactiveEnrichReview(store *storage.Store, issueKey, filterDecision stri
 			fmt.Println("✓ Accepted")
 
 		case "r", "reject":
-			fmt.Print("Reason (helps the agent do better next time): ")
-			reason, err := reader.ReadString('\n')
+			reason, err := readLineWithEditing("Reason (helps the agent do better next time): ")
+			if err == readline.ErrInterrupt || err == io.EOF {
+				fmt.Println("  (cancelled)")
+				continue
+			}
 			if err != nil {
 				return err
 			}
-			reason = strings.TrimSpace(reason)
 			issue.Enrichment.Decision = storage.EnrichRejected
 			issue.Enrichment.RejectionReason = reason
 			if err := store.SaveStoredIssue(issue); err != nil {
@@ -899,11 +1125,27 @@ func interactiveEnrichReview(store *storage.Store, issueKey, filterDecision stri
 			i++
 			fmt.Println("⏸ Deferred")
 
+		case "s", "skip":
+			reason, err := readLineWithEditing("Reason (optional): ")
+			if err == readline.ErrInterrupt || err == io.EOF {
+				fmt.Println("  (cancelled)")
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if err := store.UpdateDecision(issue.Issue.Key, storage.DecisionSkip, reason); err != nil {
+				return err
+			}
+			skipped++
+			i++
+			fmt.Println("✗ Skipped (permanently)")
+
 		case "v", "view":
 			displayFullEnrichment(issue)
 
 		case "q", "quit":
-			fmt.Printf("\nSession ended. Accepted: %d, Rejected: %d, Deferred: %d\n", accepted, rejected, deferred)
+			fmt.Printf("\nSession ended. Accepted: %d, Rejected: %d, Deferred: %d, Skipped: %d\n", accepted, rejected, deferred, skipped)
 			return nil
 
 		case "?", "help":
@@ -916,8 +1158,24 @@ func interactiveEnrichReview(store *storage.Store, issueKey, filterDecision stri
 		fmt.Println()
 	}
 
-	fmt.Printf("\nAll reviewed! Accepted: %d, Rejected: %d, Deferred: %d\n", accepted, rejected, deferred)
+	fmt.Printf("\nAll reviewed! Accepted: %d, Rejected: %d, Deferred: %d, Skipped: %d\n", accepted, rejected, deferred, skipped)
 	return nil
+}
+
+// readLineWithEditing opens a short-lived readline instance for a single prompted
+// input, giving the user arrow-key navigation and line editing. readline is closed
+// immediately after the read so it does not hold raw mode while fmt.Printf output runs.
+func readLineWithEditing(prompt string) (string, error) {
+	rl, err := readline.New(prompt)
+	if err != nil {
+		return "", err
+	}
+	defer rl.Close()
+	line, err := rl.Readline()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(line), nil
 }
 
 func displayEnrichmentDiff(issue *storage.StoredIssue, current, total int) {
@@ -1063,8 +1321,9 @@ func printEnrichReviewHelp() {
 	fmt.Println(`
 Commands:
   a, accept  - Accept proposed changes
-  r, reject  - Reject proposed changes (keep original)
+  r, reject  - Reject proposed changes (re-queues for agent retry)
   d, defer   - Defer decision for later
+  s, skip    - Permanently skip this issue (removes from migration)
   v, view    - Show full original + proposed side by side
   q, quit    - Save and quit
   ?, help    - Show this help`)
@@ -1111,10 +1370,10 @@ func showEnrichStatus(store *storage.Store) error {
 	pendingReview := byDecision[storage.EnrichPending] + byDecision[storage.EnrichDeferred]
 
 	if remaining > 0 {
-		fmt.Printf("\n  %d issues not yet enriched. Run 'fuckjira enrich' to process.\n", remaining)
+		fmt.Printf("\n  %d issues not yet enriched. Run 'screwjira enrich' to process.\n", remaining)
 	}
 	if pendingReview > 0 {
-		fmt.Printf("  %d enrichments awaiting review. Run 'fuckjira enrich --review' to review.\n", pendingReview)
+		fmt.Printf("  %d enrichments awaiting review. Run 'screwjira enrich --review' to review.\n", pendingReview)
 	}
 
 	return nil

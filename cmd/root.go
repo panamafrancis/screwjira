@@ -13,7 +13,7 @@ var (
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "fuckjira",
+	Use:   "screwjira",
 	Short: "Migrate Jira issues to GitHub Projects",
 	Long:  `A CLI tool to export issues from Jira/JPD to GitHub Projects with filtering and enrichment.`,
 }
@@ -24,7 +24,7 @@ func Execute() error {
 
 func init() {
 	cobra.OnInitialize(initConfig)
-	rootCmd.PersistentFlags().StringVar(&dataDir, "data-dir", "", "data directory (default: ~/.fuckjira)")
+	rootCmd.PersistentFlags().StringVar(&dataDir, "data-dir", "", "data directory (default: ~/.screwjira)")
 }
 
 func initConfig() {
@@ -34,7 +34,7 @@ func initConfig() {
 			fmt.Fprintln(os.Stderr, "Error getting home directory:", err)
 			os.Exit(1)
 		}
-		dataDir = filepath.Join(home, ".fuckjira")
+		dataDir = filepath.Join(home, ".screwjira")
 	}
 }
 

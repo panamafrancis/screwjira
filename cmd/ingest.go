@@ -4,8 +4,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/fraud-zero/fuckjira/internal/jira"
-	"github.com/fraud-zero/fuckjira/internal/storage"
+	"github.com/fraud-zero/screwjira/internal/config"
+	"github.com/fraud-zero/screwjira/internal/jira"
+	"github.com/fraud-zero/screwjira/internal/storage"
 	"github.com/spf13/cobra"
 )
 
@@ -14,25 +15,9 @@ var (
 	ingestAll     bool
 	ingestStatus  bool
 	ingestLimit   int
+	ingestSync    bool
 )
 
-// Project configurations
-var projects = map[string]struct {
-	Name      string
-	JQL       string
-	ExcludeStatuses []string
-}{
-	"F0": {
-		Name:      "Product Development",
-		JQL:       `project = "F0" AND status NOT IN ("Done", "Won't Do") ORDER BY created ASC`,
-		ExcludeStatuses: []string{"Done", "Won't Do"},
-	},
-	"DISC": {
-		Name:      "Discovery (JPD)",
-		JQL:       `project = "DISC" AND status NOT IN ("Released", "Abandoned") ORDER BY created ASC`,
-		ExcludeStatuses: []string{"Released", "Abandoned"},
-	},
-}
 
 var ingestCmd = &cobra.Command{
 	Use:   "ingest",
@@ -43,10 +28,11 @@ var ingestCmd = &cobra.Command{
 
 func init() {
 	rootCmd.AddCommand(ingestCmd)
-	ingestCmd.Flags().StringVarP(&ingestProject, "project", "p", "", "project to ingest (F0 or DISC)")
-	ingestCmd.Flags().BoolVar(&ingestAll, "all", false, "ingest all projects")
+	ingestCmd.Flags().StringVarP(&ingestProject, "project", "p", "", "Jira project key to ingest (e.g. ENG)")
+	ingestCmd.Flags().BoolVar(&ingestAll, "all", false, "ingest all configured projects")
 	ingestCmd.Flags().BoolVar(&ingestStatus, "status", false, "show ingestion status")
 	ingestCmd.Flags().IntVarP(&ingestLimit, "limit", "l", 0, "limit number of issues to fetch (0=all)")
+	ingestCmd.Flags().BoolVar(&ingestSync, "sync", false, "re-fetch all stored issues and auto-skip ones that are now closed")
 }
 
 func runIngest(cmd *cobra.Command, args []string) error {
@@ -59,47 +45,65 @@ func runIngest(cmd *cobra.Command, args []string) error {
 		return showIngestStatus(store)
 	}
 
+	cfg, err := config.Load(getDataDir())
+	if err != nil {
+		return err
+	}
+
+	if ingestSync {
+		return syncIssues(store, cfg)
+	}
+
 	if !ingestAll && ingestProject == "" {
 		return fmt.Errorf("specify --project or --all")
 	}
 
-	var projectsToIngest []string
+	if len(cfg.Projects) == 0 {
+		return fmt.Errorf("no projects configured — add [[projects]] blocks to config.toml")
+	}
+
+	var toIngest []*config.ProjectConfig
 	if ingestAll {
-		for p := range projects {
-			projectsToIngest = append(projectsToIngest, p)
+		for i := range cfg.Projects {
+			toIngest = append(toIngest, &cfg.Projects[i])
 		}
 	} else {
 		p := strings.ToUpper(ingestProject)
-		if _, ok := projects[p]; !ok {
-			return fmt.Errorf("unknown project: %s (valid: F0, DISC)", ingestProject)
+		proj := cfg.ProjectByKey(p)
+		if proj == nil {
+			keys := make([]string, 0, len(cfg.Projects))
+			for _, pc := range cfg.Projects {
+				keys = append(keys, pc.Key)
+			}
+			return fmt.Errorf("unknown project: %s (configured: %s)", ingestProject, strings.Join(keys, ", "))
 		}
-		projectsToIngest = []string{p}
+		toIngest = []*config.ProjectConfig{proj}
 	}
 
-	for _, project := range projectsToIngest {
-		if err := ingestProject_(store, project); err != nil {
+	for _, proj := range toIngest {
+		if err := ingestProject_(store, proj); err != nil {
 			return err
 		}
 	}
 
+	if err := normalizeIssueTypes(store, true, cfg); err != nil {
+		fmt.Printf("Warning: type normalisation failed: %v\n", err)
+	}
 	return showIngestStatus(store)
 }
 
-func ingestProject_(store *storage.Store, project string) error {
-	cfg := projects[project]
-	fmt.Printf("Ingesting %s (%s)...\n", project, cfg.Name)
+func ingestProject_(store *storage.Store, proj *config.ProjectConfig) error {
+	fmt.Printf("Ingesting %s (%s)...\n", proj.Key, proj.Name)
 
-	// First get count
-	count, err := jira.Count(cfg.JQL)
+	count, err := jira.Count(proj.JQL)
 	if err != nil {
 		return fmt.Errorf("failed to count issues: %w", err)
 	}
 	fmt.Printf("  Found %d issues\n", count)
 
-	// Fetch all issue keys
 	limit := ingestLimit
 	fmt.Printf("  Fetching issue list...")
-	issues, err := jira.Search(cfg.JQL, limit)
+	issues, err := jira.Search(proj.JQL, limit)
 	if err != nil {
 		return fmt.Errorf("failed to search issues: %w", err)
 	}
@@ -144,6 +148,92 @@ func showIngestStatus(store *storage.Store) error {
 	fmt.Printf("  Defer:   %d\n", stats.Defer)
 
 	return nil
+}
+
+func syncIssues(store *storage.Store, cfg *config.Config) error {
+	all, err := store.ListAllIssues()
+	if err != nil {
+		return err
+	}
+
+	var toSync []*storage.StoredIssue
+	for _, issue := range all {
+		if issue.Decision != storage.DecisionSkip {
+			toSync = append(toSync, issue)
+		}
+	}
+
+	fmt.Printf("Syncing %d issues (skipping already-skipped)...\n", len(toSync))
+
+	updated, skipped, failed, reenriched := 0, 0, 0, 0
+	for i, stored := range toSync {
+		key := stored.Issue.Key
+		fmt.Printf("\r  [%d/%d] %s", i+1, len(toSync), key)
+
+		fresh, err := jira.GetIssue(key)
+		if err != nil {
+			fmt.Printf("\n  Warning: could not fetch %s: %v — auto-skipping\n", key, err)
+			_ = store.UpdateDecision(key, storage.DecisionSkip, "sync: issue not found in Jira")
+			skipped++
+			failed++
+			continue
+		}
+
+		// Check if the issue has moved to a terminal status.
+		projectKey := strings.ToUpper(strings.SplitN(key, "-", 2)[0])
+		if proj := cfg.ProjectByKey(projectKey); proj != nil {
+			status := fresh.Status()
+			for _, terminal := range proj.ExcludeStatuses {
+				if strings.EqualFold(status, terminal) {
+					_ = store.SaveIssue(fresh)
+					_ = store.UpdateDecision(key, storage.DecisionSkip, fmt.Sprintf("sync: status=%s", status))
+					skipped++
+					goto next
+				}
+			}
+		}
+
+		// Still open — detect important field changes, then refresh Jira fields.
+		{
+			changedFields := jira.CompareIssueFields(stored.Issue, fresh)
+			if err := store.SaveIssue(fresh); err != nil {
+				fmt.Printf("\n  Warning: failed to save %s: %v\n", key, err)
+				failed++
+				goto next
+			}
+			updated++
+
+			if len(changedFields) > 0 && stored.Enrichment != nil {
+				reason := fmt.Sprintf("sync: fields changed: %s", strings.Join(changedFields, ", "))
+				stored.Issue = fresh
+				switch stored.Enrichment.Decision {
+				case storage.EnrichAccepted:
+					stored.Enrichment.Decision = storage.EnrichRejected
+					stored.Enrichment.RejectionReason = reason
+				case storage.EnrichRejected:
+					if stored.Enrichment.RejectionReason != "" {
+						stored.Enrichment.RejectionReason += "; " + reason
+					} else {
+						stored.Enrichment.RejectionReason = reason
+					}
+				default:
+					stored.Enrichment = nil
+				}
+				if err := store.SaveStoredIssue(stored); err == nil {
+					fmt.Printf("\n  %s: fields changed (%s), enrichment reset\n", key, strings.Join(changedFields, ", "))
+					reenriched++
+				}
+			}
+		}
+	next:
+	}
+
+	fmt.Printf("\nSync complete: %d updated, %d auto-skipped, %d errors, %d enrichments reset\n",
+		updated, skipped, failed, reenriched)
+	if err := normalizeIssueTypes(store, true, cfg); err != nil {
+		fmt.Printf("Warning: type normalisation failed: %v\n", err)
+	}
+	return showIngestStatus(store)
 }
 
 func truncate(s string, max int) string {

@@ -5,7 +5,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/fraud-zero/fuckjira/internal/storage"
+	"github.com/fraud-zero/screwjira/internal/storage"
 	"github.com/spf13/cobra"
 )
 
@@ -124,7 +124,7 @@ func runClassifyStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(issues) == 0 {
-		fmt.Println("No kept issues to classify. Run 'fuckjira filter' first.")
+		fmt.Println("No kept issues to classify. Run 'screwjira filter' first.")
 		return nil
 	}
 
@@ -163,9 +163,9 @@ func runClassifyStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Println("\nSubcommands:")
-	fmt.Println("  fuckjira classify labels    Propose GitHub label scheme")
-	fmt.Println("  fuckjira classify types     Reclassify as task/bug/idea")
-	fmt.Println("  fuckjira classify epics     Convert epics to ideas, merge duplicates")
+	fmt.Println("  screwjira classify labels    Propose GitHub label scheme")
+	fmt.Println("  screwjira classify types     Reclassify as task/bug/idea")
+	fmt.Println("  screwjira classify epics     Convert epics to ideas, merge duplicates")
 
 	return nil
 }
@@ -204,7 +204,7 @@ func runClassifyLabels(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("\nProposal saved to %s/classified/labels.json\n", getDataDir())
-	fmt.Println("Edit the file to adjust, then run 'fuckjira classify labels --apply'")
+	fmt.Println("Edit the file to adjust, then run 'screwjira classify labels --apply'")
 	return nil
 }
 
@@ -315,7 +315,7 @@ func displayLabelProposal(proposal *LabelProposal, totalIssues int) {
 func applyLabelProposal(store *storage.Store) error {
 	var proposal LabelProposal
 	if err := store.LoadProposal("labels", &proposal); err != nil {
-		return fmt.Errorf("no label proposal found — run 'fuckjira classify labels' first: %w", err)
+		return fmt.Errorf("no label proposal found — run 'screwjira classify labels' first: %w", err)
 	}
 
 	count := 0
@@ -369,7 +369,7 @@ func runClassifyTypes(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("\nProposal saved to %s/classified/types.json\n", getDataDir())
-	fmt.Println("Edit the file to adjust types, then run 'fuckjira classify types --apply'")
+	fmt.Println("Edit the file to adjust types, then run 'screwjira classify types --apply'")
 	return nil
 }
 
@@ -465,7 +465,7 @@ func displayTypeProposal(proposal *TypeProposal) {
 func applyTypeProposal(store *storage.Store) error {
 	var proposal TypeProposal
 	if err := store.LoadProposal("types", &proposal); err != nil {
-		return fmt.Errorf("no type proposal found — run 'fuckjira classify types' first: %w", err)
+		return fmt.Errorf("no type proposal found — run 'screwjira classify types' first: %w", err)
 	}
 
 	count := 0
@@ -525,7 +525,7 @@ func runClassifyEpics(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("\nProposal saved to %s/classified/epics.json\n", getDataDir())
-	fmt.Println("Edit merges in the file, then run 'fuckjira classify epics --apply'")
+	fmt.Println("Edit merges in the file, then run 'screwjira classify epics --apply'")
 	return nil
 }
 
@@ -711,7 +711,7 @@ func displayEpicProposal(proposal *EpicProposal) {
 func applyEpicProposal(store *storage.Store) error {
 	var proposal EpicProposal
 	if err := store.LoadProposal("epics", &proposal); err != nil {
-		return fmt.Errorf("no epic proposal found — run 'fuckjira classify epics' first: %w", err)
+		return fmt.Errorf("no epic proposal found — run 'screwjira classify epics' first: %w", err)
 	}
 
 	// Build merge lookup: epic key -> DISC idea key

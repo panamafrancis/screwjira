@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"sort"
+	"strings"
 )
 
 // Issue represents a Jira issue with all fields
@@ -233,33 +235,154 @@ func (i *Issue) Description() string {
 	return ""
 }
 
-// extractTextFromADF extracts plain text from Atlassian Document Format
-func extractTextFromADF(doc map[string]interface{}) string {
-	content, ok := doc["content"].([]interface{})
-	if !ok {
-		return ""
+// CompareIssueFields returns the names of important fields that differ between old and fresh.
+// Status, assignee, reporter, and timestamps are intentionally excluded.
+func CompareIssueFields(old, fresh *Issue) []string {
+	var changed []string
+	if old.Summary() != fresh.Summary() {
+		changed = append(changed, "summary")
 	}
+	if old.Description() != fresh.Description() {
+		changed = append(changed, "description")
+	}
+	if !equalStringSlices(sortedStrings(old.Labels()), sortedStrings(fresh.Labels())) {
+		changed = append(changed, "labels")
+	}
+	if !equalStringSlices(sortedStrings(old.Components()), sortedStrings(fresh.Components())) {
+		changed = append(changed, "components")
+	}
+	if old.IssueType() != fresh.IssueType() {
+		changed = append(changed, "issuetype")
+	}
+	if old.Priority() != fresh.Priority() {
+		changed = append(changed, "priority")
+	}
+	return changed
+}
 
-	var result string
-	for _, block := range content {
-		blockMap, ok := block.(map[string]interface{})
+func sortedStrings(s []string) []string {
+	c := make([]string, len(s))
+	copy(c, s)
+	sort.Strings(c)
+	return c
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// Attachment represents a file attached to a Jira issue.
+type Attachment struct {
+	ID       string
+	Filename string
+	MimeType string
+	Content  string // authenticated download URL
+}
+
+// Attachments returns file attachments on this issue.
+func (i *Issue) Attachments() []Attachment {
+	list, ok := i.Fields["attachment"].([]interface{})
+	if !ok {
+		return nil
+	}
+	var result []Attachment
+	for _, item := range list {
+		m, ok := item.(map[string]interface{})
 		if !ok {
 			continue
 		}
-		innerContent, ok := blockMap["content"].([]interface{})
-		if !ok {
-			continue
+		var a Attachment
+		if v, ok := m["id"].(string); ok {
+			a.ID = v
 		}
-		for _, item := range innerContent {
-			itemMap, ok := item.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			if text, ok := itemMap["text"].(string); ok {
-				result += text
-			}
+		if v, ok := m["filename"].(string); ok {
+			a.Filename = v
 		}
-		result += "\n"
+		if v, ok := m["mimeType"].(string); ok {
+			a.MimeType = v
+		}
+		if v, ok := m["content"].(string); ok {
+			a.Content = v
+		}
+		if a.ID != "" && a.Filename != "" {
+			result = append(result, a)
+		}
 	}
 	return result
+}
+
+// extractTextFromADF extracts plain text from Atlassian Document Format.
+// ADF is a tree: doc → blocks (paragraph, bulletList, …) → inlines (text, hardBreak, …).
+// Lists add an extra level: bulletList → listItem → paragraph → text.
+func extractTextFromADF(doc map[string]interface{}) string {
+	var sb strings.Builder
+	walkADF(doc, &sb)
+	return strings.TrimSpace(sb.String())
+}
+
+func walkADF(node map[string]interface{}, sb *strings.Builder) {
+	nodeType, _ := node["type"].(string)
+
+	switch nodeType {
+	case "text":
+		if text, ok := node["text"].(string); ok {
+			sb.WriteString(text)
+		}
+		return
+	case "hardBreak":
+		sb.WriteString("\n")
+		return
+	case "mention":
+		if attrs, ok := node["attrs"].(map[string]interface{}); ok {
+			if text, ok := attrs["text"].(string); ok {
+				sb.WriteString(text)
+			}
+		}
+		return
+	case "media":
+		// Emit a placeholder replaced with a GitHub-hosted URL during post.
+		if attrs, ok := node["attrs"].(map[string]interface{}); ok {
+			if id, ok := attrs["id"].(string); ok {
+				sb.WriteString(fmt.Sprintf("[[JIRA_MEDIA:%s]]", id))
+			}
+		}
+		return
+	}
+
+	content, ok := node["content"].([]interface{})
+	if !ok {
+		return
+	}
+
+	switch nodeType {
+	case "listItem":
+		sb.WriteString("- ")
+		for _, child := range content {
+			if m, ok := child.(map[string]interface{}); ok {
+				walkADF(m, sb)
+			}
+		}
+		return
+	default:
+		for _, child := range content {
+			if m, ok := child.(map[string]interface{}); ok {
+				walkADF(m, sb)
+			}
+		}
+	}
+
+	// Block-level elements get a trailing newline, but suppress the extra
+	// newline from a paragraph that's already inside a list item.
+	switch nodeType {
+	case "paragraph", "heading", "codeBlock", "blockquote", "bulletList", "orderedList", "rule", "mediaSingle":
+		sb.WriteString("\n")
+	}
 }

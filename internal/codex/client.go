@@ -46,7 +46,7 @@ func Resume(sessionID string, prompt string, opts Options) (*Response, error) {
 }
 
 func run(prompt string, sessionID string, opts Options) (*Response, error) {
-	tmpDir, err := os.MkdirTemp("", "fuckjira-codex-*")
+	tmpDir, err := os.MkdirTemp("", "screwjira-codex-*")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp dir: %w", err)
 	}
@@ -74,8 +74,12 @@ func run(prompt string, sessionID string, opts Options) (*Response, error) {
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		combined := strings.TrimSpace(string(output))
-		if isRateLimited(combined) {
-			return nil, ErrRateLimited
+		// A killed process is a crash, not a rate limit — don't retry.
+		if isCrash(err) {
+			return nil, fmt.Errorf("codex crashed (%v) — is codex installed and configured? output: %s", err, truncate(combined, 200))
+		}
+		if pattern := rateLimitMatch(combined); pattern != "" {
+			return nil, fmt.Errorf("%w (matched %q in: %s)", ErrRateLimited, pattern, truncate(combined, 200))
 		}
 		detail := combined
 		if len(detail) > 500 {
@@ -97,12 +101,27 @@ func run(prompt string, sessionID string, opts Options) (*Response, error) {
 	}, nil
 }
 
-func isRateLimited(text string) bool {
+// isCrash returns true if the error indicates the process was killed by a signal
+// (SIGKILL / SIGTERM), which means it crashed rather than exiting cleanly.
+func isCrash(err error) bool {
+	return strings.Contains(err.Error(), "signal: killed") ||
+		strings.Contains(err.Error(), "signal: terminated")
+}
+
+// rateLimitMatch returns the matched pattern if text looks like a rate limit error, or "".
+func rateLimitMatch(text string) string {
 	lower := strings.ToLower(text)
 	for _, pattern := range rateLimitPatterns {
 		if strings.Contains(lower, pattern) {
-			return true
+			return pattern
 		}
 	}
-	return false
+	return ""
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }

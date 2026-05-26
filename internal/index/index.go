@@ -16,6 +16,7 @@ const (
 	LangTypeScript Language = "typescript"
 	LangTerraform  Language = "terraform"
 	LangDataform   Language = "dataform"
+	LangMarkdown   Language = "markdown"
 	LangUnknown    Language = "unknown"
 )
 
@@ -32,6 +33,7 @@ type RepoIndex struct {
 	TSExports  []tsExport
 	TFBlocks   []tfBlock
 	DFModels   []dfModel
+	MDDocs     []mdDoc
 	ProtoFiles []protoFile // always scanned, regardless of primary language
 }
 
@@ -83,6 +85,12 @@ func IndexRepo(repoRoot string) (*RepoIndex, error) {
 			return nil, fmt.Errorf("dataform index: %w", err)
 		}
 		idx.DFModels = models
+	case LangMarkdown:
+		docs, err := indexMarkdown(repoRoot)
+		if err != nil {
+			return nil, fmt.Errorf("markdown index: %w", err)
+		}
+		idx.MDDocs = docs
 	}
 
 	// Proto overlay: always scan for .proto files
@@ -116,7 +124,36 @@ func detectLanguage(repoRoot string) Language {
 	if _, err := os.Stat(filepath.Join(repoRoot, "workflow_settings.yaml")); err == nil {
 		return LangDataform
 	}
+	// Markdown: repo consists primarily of .md files
+	if countMarkdownFiles(repoRoot) >= 3 {
+		return LangMarkdown
+	}
 	return LangUnknown
+}
+
+// countMarkdownFiles counts .md files in the repo (non-recursive root + one level deep).
+func countMarkdownFiles(repoRoot string) int {
+	count := 0
+	_ = filepath.WalkDir(repoRoot, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if path == repoRoot {
+				return nil
+			}
+			name := d.Name()
+			if skipDirs[name] || strings.HasPrefix(name, ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.ToLower(filepath.Ext(path)) == ".md" {
+			count++
+		}
+		return nil
+	})
+	return count
 }
 
 // RenderMarkdown renders all repo indexes into a compact markdown string.
@@ -137,6 +174,8 @@ func RenderMarkdown(repos []*RepoIndex) string {
 			renderTFCompact(&b, repo)
 		case LangDataform:
 			renderDFCompact(&b, repo)
+		case LangMarkdown:
+			renderMDCompact(&b, repo)
 		default:
 			// Unknown language: render file tree only
 			b.WriteString("```\n")
@@ -152,7 +191,7 @@ func RenderMarkdown(repos []*RepoIndex) string {
 
 		// Check budget after each repo
 		if b.Len() > maxIndexBytes {
-			b.WriteString("\n(index truncated — run fewer repos or use `fuckjira index` to inspect)\n")
+			b.WriteString("\n(index truncated — run fewer repos or use `screwjira index` to inspect)\n")
 			break
 		}
 	}
