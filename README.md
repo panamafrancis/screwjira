@@ -32,9 +32,9 @@ go build -o screwjira .
 
 ## Configuration
 
-screwjira looks for a config file at `~/.screwjira/config.hcl` (HCL) or `~/.screwjira/config.toml` (TOML).
+screwjira looks for a config file at `~/.screwjira/config.toml`.
 
-```hcl
+```toml
 project = "MYPROJECT"      # Jira project key
 jira_profile = "default"   # acli profile name
 
@@ -201,7 +201,7 @@ All state lives in `~/.screwjira/`:
 
 | Path | Contents |
 |---|---|
-| `config.hcl` | Configuration |
+| `config.toml` | Configuration |
 | `issues/` | Raw Jira issue JSON |
 | `enrichments/` | Claude-generated enrichments |
 | `index.md` | Codebase index |
